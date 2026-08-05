@@ -1,5 +1,6 @@
-import type { CSSProperties } from 'react'
+import { useState, type CSSProperties } from 'react'
 import { Button, Card, Checkbox, InputNumber, Popover, Select, Spin } from 'antd'
+import GreenCompareModal from './GreenCompareModal'
 import { SettingOutlined } from '@ant-design/icons'
 import {
   useDetectionStore,
@@ -177,8 +178,11 @@ export default function IconExtractPanel() {
     analyzedIcons,
     iconImageUrl,
     iconError,
+    apiKey,
     runExtractIcons,
   } = useDetectionStore()
+
+  const [greenCompareOpen, setGreenCompareOpen] = useState(false)
 
   const useAnalyzed = Boolean(analyzedIcons?.length)
   const iconCount = useAnalyzed
@@ -203,6 +207,13 @@ export default function IconExtractPanel() {
             提icon
           </span>
           <div className="flex items-center gap-2">
+            <Button
+              size="small"
+              disabled={!apiKey.trim() || iconCount === 0 || textBackStatus !== 'done'}
+              onClick={() => setGreenCompareOpen(true)}
+            >
+              绿底对比
+            </Button>
             {iconStatus === 'done' ? (
               <Button
                 size="small"
@@ -264,6 +275,11 @@ export default function IconExtractPanel() {
           )}
         </div>
       )}
+
+      <GreenCompareModal
+        open={greenCompareOpen}
+        onClose={() => setGreenCompareOpen(false)}
+      />
     </Card>
   )
 }

@@ -6,6 +6,9 @@ set -euo pipefail
 SAM2_PYTHON="/workspace/sam2-env/bin/python"
 DAEMON="/workspace/service/model_scripts/sam2_daemon.py"
 LOG="/workspace/servData/_logs/sam2d.log"
+# 2026-08-05 上线:decoder 微调版(17k UI 实例,val IoU 0.890,基线 0.748)
+# 回退:删掉这行即回官方 sam2.1_hiera_large
+export SAM2_CHECKPOINT="/workspace/outputs/sam2_train_20260805/step-7000.pt"
 
 if pgrep -f "[s]am2_daemon.py" > /dev/null; then
     echo "[sam2d.sh] already running"

@@ -32,7 +32,8 @@ export const ICON_ANALYSIS_SCHEMA = {
           index: { type: 'integer', minimum: 0 },
           description: { type: 'string' },
           positive_points: { type: 'array', items: point, minItems: 1, maxItems: 3 },
-          negative_points: { type: 'array', items: point, minItems: 3, maxItems: 8 },
+          // minItems 抬高到 6:模型习惯贴下限给点,3 会导致每次只有 3~4 个负点
+          negative_points: { type: 'array', items: point, minItems: 6, maxItems: 10 },
         },
         required: ['index', 'description', 'positive_points', 'negative_points'],
         additionalProperties: false,
