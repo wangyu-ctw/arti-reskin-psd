@@ -26,6 +26,8 @@ import {
   fetchImageAsDataUrl,
   type AnalyzedIcon,
 } from '../lib/iconAnalysis'
+import { extractTextFront } from '../lib/textFront'
+import { clampIconPoints } from '../lib/pointClamp'
 
 export const DEFAULT_TEXT_BACK_PROMPT = stepDefaults.textBack.prompt
 
@@ -112,6 +114,9 @@ interface DetectionState {
   textBackPrompt: string
   textBackSeed: number
   textBackSteps: number
+  // 保护合成:只有 YOLO text 框内取重生成像素,其余保留原图,icon 不可能被误删
+  textBackProtect: boolean
+  textBackProtectGrow: number
   textBackStatus: TextBackStatus
   textBackImageUrl: string
   textBackError: string
@@ -128,9 +133,15 @@ interface DetectionState {
   iconAnalysisStatus: TextBackStatus
   iconAnalysisError: string
   analyzedIcons: AnalyzedIcon[] | null
+  // 域钳制结果说明(修正了几个越域点)
+  iconClampInfo: string
   // 第 7 步:提 icon(sam2 抠图)
   // 提icon源图:text_back=去字图 / origin=原图 / auto=双源逐 icon 按 SAM2 自评分择优
   iconSource: 'text_back' | 'origin' | 'auto'
+  // 第 6 步文字层:原图与去字图差值还原,生成后静默上传 pod(text_front.png)
+  textFrontStatus: TextBackStatus
+  textFrontImageUrl: string
+  textFrontError: string
   iconTierParams: Record<IconTier, IconTierParams>
   iconSmallMaxSide: number
   iconLargeMinSide: number
@@ -161,6 +172,7 @@ interface DetectionState {
   midHoleStatus: TextBackStatus
   midHoleImageUrl: string
   midHoleError: string
+  midHoleGrow: number // 洞外扩(腐蚀保留区)像素,0=按图层 alpha 原样挖
   // 第 13 步:修补(对第 12 步破洞图的透明区做 flux_fill,默认挂 icon_back LoRA)
   midFillStatus: TextBackStatus
   midFillImageUrl: string
@@ -173,6 +185,11 @@ interface DetectionState {
   midFillMaskBlur: number
   midFillMaxPixels: number
   midFillFillHoles: boolean
+  // 第 15 步:前中景对比(6/8/10/11/12/14 图层本地拼合,与原图滑杆对比,不上传)
+  compareStatus: TextBackStatus
+  compareImageUrl: string
+  compareError: string
+  compareMissing: string
   bboxType: string
   structuredResult: StructuredResult | null
   outputText: string
@@ -213,6 +230,8 @@ interface DetectionState {
   runMidExtract: () => Promise<void>
   runMidHole: () => Promise<void>
   runMidFill: () => Promise<void>
+  runTextFront: () => Promise<void>
+  runCompare: () => Promise<void>
   submit: () => Promise<void>
   cancel: () => void
   clearOutput: () => void
@@ -344,6 +363,8 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   textBackPrompt: stepDefaults.textBack.prompt,
   textBackSeed: stepDefaults.textBack.seed,
   textBackSteps: stepDefaults.textBack.steps,
+  textBackProtect: true,
+  textBackProtectGrow: 8,
   textBackStatus: 'idle',
   textBackImageUrl: '',
   textBackError: '',
@@ -357,7 +378,11 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   iconAnalysisStatus: 'idle',
   iconAnalysisError: '',
   analyzedIcons: null,
+  iconClampInfo: '',
   iconSource: 'auto',
+  textFrontStatus: 'idle',
+  textFrontImageUrl: '',
+  textFrontError: '',
   iconTierParams: {
     small: { ...stepDefaults.iconExtract.small },
     medium: { ...stepDefaults.iconExtract.medium },
@@ -393,6 +418,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   midHoleStatus: 'idle',
   midHoleImageUrl: '',
   midHoleError: '',
+  midHoleGrow: 0,
   midFillStatus: 'idle',
   midFillImageUrl: '',
   midFillError: '',
@@ -404,6 +430,10 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   midFillMaskBlur: stepDefaults.iconBack.maskBlur,
   midFillMaxPixels: stepDefaults.iconBack.maxPixels,
   midFillFillHoles: stepDefaults.iconBack.fillHoles,
+  compareStatus: 'idle',
+  compareImageUrl: '',
+  compareError: '',
+  compareMissing: '',
   bboxType: 'text',
   structuredResult: null,
   outputText: '',
@@ -434,9 +464,13 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       iconAnalysisStatus: 'idle',
       iconAnalysisError: '',
       analyzedIcons: null,
+      iconClampInfo: '',
       iconStatus: 'idle',
       iconImageUrl: '',
       iconError: '',
+      textFrontStatus: 'idle',
+      textFrontImageUrl: '',
+      textFrontError: '',
       iconBackStatus: 'idle',
       iconBackImageUrl: '',
       iconBackError: '',
@@ -449,6 +483,10 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       midFillStatus: 'idle',
       midFillImageUrl: '',
       midFillError: '',
+      compareStatus: 'idle',
+      compareImageUrl: '',
+      compareError: '',
+      compareMissing: '',
     })
     // 选中图片即自动上传到 RunPod,创建 run 目录
     if (file) void get().uploadOrigin()
@@ -521,6 +559,9 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         analyzedIcons: null,
         iconStatus: has('icons.png') ? 'done' : 'idle',
         iconImageUrl: has('icons.png') ? fileUrl('icons.png') : '',
+        textFrontStatus: has('text_front.png') ? 'done' : 'idle',
+        textFrontImageUrl: has('text_front.png') ? fileUrl('text_front.png') : '',
+        textFrontError: '',
         iconError: '',
         iconBackStatus: has('icon_back.png') ? 'done' : 'idle',
         iconBackImageUrl: has('icon_back.png') ? fileUrl('icon_back.png') : '',
@@ -571,7 +612,8 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     // 重新生成去字图后,基于它的 icon 分析和去 icon 结果一定过期;
     // icon 提取仅在"从去文字图提取"模式下过期,从原图提取的结果不受影响
     set({ textBackStatus: 'running', textBackError: '',
-          iconAnalysisStatus: 'idle', iconAnalysisError: '', analyzedIcons: null,
+          textFrontStatus: 'idle', textFrontImageUrl: '', textFrontError: '',
+          iconAnalysisStatus: 'idle', iconAnalysisError: '', analyzedIcons: null, iconClampInfo: '',
           iconBackStatus: 'idle', iconBackImageUrl: '', iconBackError: '',
           ...(get().iconSource === 'origin'
             ? {}
@@ -581,6 +623,8 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         prompt: textBackPrompt.trim() || DEFAULT_TEXT_BACK_PROMPT,
         seed: textBackSeed,
         steps: textBackSteps,
+        protect: get().textBackProtect,
+        protect_grow: get().textBackProtectGrow,
       })
       await waitTask(task_id, { intervalMs: 2000 })
       // 等待期间换了图,丢弃过期结果
@@ -644,7 +688,14 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         ...a,
         bbox: icons[a.index]?.bbox ?? icons[i]?.bbox ?? a.bbox,
       }))
-      set({ iconAnalysisStatus: 'done', analyzedIcons: withBbox })
+      // 取点域钳制:落错域的点投影回合法域(纯几何,不看图、不增删点)
+      const { icons: clamped, moved } = clampIconPoints(withBbox)
+      set({
+        iconAnalysisStatus: 'done',
+        analyzedIcons: clamped,
+        iconClampInfo:
+          moved > 0 ? `域钳制修正了 ${moved} 个越域点位` : '所有点位均在合法域内',
+      })
     } catch (error) {
       if (get().runInfo?.run_id !== runInfo.run_id) return
       set({
@@ -844,8 +895,30 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       midFillError: '',
     })
     try {
+      // 串行分层:assets 直接从去icon图提;button 从"挖掉 assets 的破洞图"提;
+      // bar 从"再挖掉 button 的破洞图"提。前序层未提取时自动降级用已有的最深层。
+      const subtractFor: Record<MidKey, MidKey[]> = {
+        assets: [],
+        button: ['assets'],
+        bar: ['assets', 'button'],
+      }
+      let image = 'icon_back.png'
+      const doneLayers = subtractFor[cat].filter(
+        (k) => get().midStatus[k] === 'done',
+      )
+      if (doneLayers.length > 0) {
+        const holeName = cat === 'button' ? 'mid_hole_a.png' : 'mid_hole_ab.png'
+        const { task_id: holeId } = await submitTask('mid_hole', runInfo.run_id, {
+          image: 'icon_back.png',
+          sources: doneLayers.map((k) => `${k}.png`),
+          output: holeName,
+          fill_rgb: [0, 0, 0],
+        })
+        await waitTask(holeId, { intervalMs: 1000 })
+        image = holeName
+      }
       const { task_id } = await submitTask('sam2', runInfo.run_id, {
-        image: 'icon_back.png',
+        image,
         output: `${cat}.png`,
         borders,
         padding_ratio: p.paddingRatio,
@@ -882,26 +955,17 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   runMidExtract: async () => {
     const { runInfo, iconBackStatus, structuredResult, runMidOne } = get()
     if (!runInfo || iconBackStatus !== 'done') return
-    const assets = pickDetections(structuredResult, 'assets')
-    const bar = pickDetections(structuredResult, 'bar')
-    const button = pickDetections(structuredResult, 'button')
-
-    const jobs: Promise<void>[] = []
-    // button 与 bar/assets 不重叠,始终可以直接开始
-    if (button.length > 0) jobs.push(runMidOne('button'))
-    // assets 与 bar 有重叠时:先提完 assets 再提 bar;无重叠则并行提交
-    if (assets.length > 0 && bar.length > 0 && detectOverlay(assets, bar).length > 0) {
-      jobs.push(
-        (async () => {
-          await runMidOne('assets')
-          await runMidOne('bar')
-        })(),
-      )
-    } else {
-      if (assets.length > 0) jobs.push(runMidOne('assets'))
-      if (bar.length > 0) jobs.push(runMidOne('bar'))
+    // 严格串行:assets → button → bar,后一步都在前一步挖洞后的图上提取,
+    // 已移除的元素不再干扰 SAM2 对下一层的判断
+    if (pickDetections(structuredResult, 'assets').length > 0) {
+      await runMidOne('assets')
     }
-    await Promise.all(jobs)
+    if (pickDetections(structuredResult, 'button').length > 0) {
+      await runMidOne('button')
+    }
+    if (pickDetections(structuredResult, 'bar').length > 0) {
+      await runMidOne('bar')
+    }
   },
 
   runMidHole: async () => {
@@ -913,7 +977,9 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     set({ midHoleStatus: 'running', midHoleError: '',
           midFillStatus: 'idle', midFillImageUrl: '', midFillError: '' })
     try {
-      const { task_id } = await submitTask('mid_hole', runInfo.run_id, {})
+      const { task_id } = await submitTask('mid_hole', runInfo.run_id, {
+        grow: get().midHoleGrow,
+      })
       await waitTask(task_id, { intervalMs: 1500 })
       if (get().runInfo?.run_id !== runInfo.run_id) return
       set({
@@ -973,6 +1039,102 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       set({
         midFillStatus: 'error',
         midFillError: error instanceof Error ? error.message : '修补失败',
+      })
+    }
+  },
+
+  runTextFront: async () => {
+    const { runInfo, textBackStatus, textFrontStatus, textBackImageUrl } = get()
+    if (!runInfo || textBackStatus !== 'done') return
+    if (textFrontStatus === 'running') return
+    set({ textFrontStatus: 'running', textFrontError: '' })
+    try {
+      const base = `/api/runs/${runInfo.run_id}/files`
+      // 原图恒取 pod(本地 previewUrl 可能已被释放);去字图优先当前展示的那份
+      const blob = await extractTextFront(
+        `${base}/origin.png`,
+        textBackImageUrl || `${base}/text_back.png`,
+      )
+      const put = await fetch(`${base}/text_front.png`, {
+        method: 'POST',
+        body: blob,
+      })
+      if (!put.ok) throw new Error(`上传失败:HTTP ${put.status}`)
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        textFrontStatus: 'done',
+        textFrontImageUrl: `${base}/text_front.png?t=${Date.now()}`,
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        textFrontStatus: 'error',
+        textFrontError: error instanceof Error ? error.message : '生成失败',
+      })
+    }
+  },
+
+  runCompare: async () => {
+    const { runInfo, compareStatus } = get()
+    if (!runInfo || compareStatus === 'running') return
+    set({ compareStatus: 'running', compareError: '', compareMissing: '' })
+    const loadImg = (url: string) =>
+      new Promise<HTMLImageElement>((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => resolve(img)
+        img.onerror = () => reject(new Error('load failed'))
+        img.src = url
+      })
+    try {
+      const base = `/api/runs/${runInfo.run_id}/files`
+      const t = Date.now()
+      const origin = await loadImg(`${base}/origin.png?t=${t}`)
+      const canvas = document.createElement('canvas')
+      canvas.width = origin.naturalWidth
+      canvas.height = origin.naturalHeight
+      const ctx = canvas.getContext('2d')!
+      ctx.imageSmoothingQuality = 'high'
+
+      // 图层序(自底向上):修补底图 → bar → button → assets → icons → 文字层
+      // (与串行提取的移除顺序互逆:先移除的压在上面)
+      const layers = [
+        ['mid_fill.png', '14修补'],
+        ['bar.png', '12提bar'],
+        ['button.png', '11提button'],
+        ['assets.png', '10提assets'],
+        ['icons.png', '8提icon'],
+        // ['text_front.png', '6文字层'],
+      ] as const
+      const missing: string[] = []
+      let drawn = 0
+      for (const [file, label] of layers) {
+        try {
+          const img = await loadImg(`${base}/${file}?t=${t}`)
+          // 各层可能是 16 对齐尺寸,统一拉伸到原图画布
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+          drawn += 1
+        } catch {
+          missing.push(label)
+        }
+      }
+      if (drawn === 0) throw new Error('六个图层一个都不存在,请先完成前置步骤')
+
+      const blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('导出失败'))), 'image/png'),
+      )
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      const prev = get().compareImageUrl
+      if (prev.startsWith('blob:')) URL.revokeObjectURL(prev)
+      set({
+        compareStatus: 'done',
+        compareImageUrl: URL.createObjectURL(blob),
+        compareMissing: missing.length ? `缺少图层:${missing.join('、')}` : '',
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        compareStatus: 'error',
+        compareError: error instanceof Error ? error.message : '拼合失败',
       })
     }
   },
@@ -1080,7 +1242,8 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     })
 
     try {
-      // 去字图来源:本地上传的优先;否则取回第 2 步生成的(原图在前,去字图在后)
+      // 单图协议:只传去字图(保护合成后,除文字区外与原图逐像素一致,
+      // 原图不再提供,避免模型认错图;text 类由 YOLO 行透传)。本地上传的优先。
       let textBackFile: File
       if (state.textBackLocalFile) {
         textBackFile = state.textBackLocalFile
@@ -1095,10 +1258,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
           type: 'image/png',
         })
       }
-      const content = await buildUserContent(combinedUserPrompt, [
-        state.file,
-        textBackFile,
-      ])
+      const content = await buildUserContent(combinedUserPrompt, [textBackFile])
       const cacheKey = createCacheKey(systemPrompt, combinedUserPrompt)
       const provider: Record<string, unknown> = { require_parameters: true }
       if (state.speedMode !== 'balanced') provider.sort = state.speedMode

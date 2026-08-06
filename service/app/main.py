@@ -119,6 +119,28 @@ async def put_run_file(run_id: str, filename: str, request: Request):
     return {"path": str(path), "bytes": len(body)}
 
 
+SEEDSEEK_ROOT = Path("/workspace/seedseek")
+
+
+@app.post("/seedseek/{subpath:path}")
+async def put_seedseek_file(subpath: str, request: Request):
+    """找 seed 工具的结果集中存放:写入 /workspace/seedseek/<会话>/<文件>。
+
+    只允许两级相对路径(会话目录/文件名),防目录穿越。
+    """
+    path = (SEEDSEEK_ROOT / subpath).resolve()
+    if SEEDSEEK_ROOT.resolve() not in path.parents:
+        raise HTTPException(403, "path must stay inside /workspace/seedseek")
+    if len(path.relative_to(SEEDSEEK_ROOT.resolve()).parts) > 2:
+        raise HTTPException(403, "at most <session>/<filename>")
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "empty body")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return {"path": str(path), "bytes": len(body)}
+
+
 # ---- 任务提交 / 轮询 ----
 
 class SubmitTaskRequest(BaseModel):

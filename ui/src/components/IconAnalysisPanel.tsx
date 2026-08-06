@@ -1,7 +1,9 @@
+import { useState } from 'react'
 import { Button, Card, Divider, Input, InputNumber, Select, Spin } from 'antd'
 import { useDetectionStore } from '../stores/useDetectionStore'
 import { pickDetections } from '../lib/detection'
 import stepDefaults from '../config/stepDefaults'
+import AnalysisViewerModal from './AnalysisViewerModal'
 
 const { TextArea } = Input
 
@@ -84,12 +86,14 @@ export default function IconAnalysisPanel() {
     iconAnalysisStatus,
     iconAnalysisError,
     analyzedIcons,
+    iconClampInfo,
     runAnalyzeIcons,
   } = useDetectionStore()
 
   // 与第 5 步/分析逻辑同口径:不计 discard 的审计记录
   const iconCount = pickDetections(structuredResult, 'icon').length
   const canAnalyze = textBackStatus === 'done' && iconCount > 0
+  const [viewerOpen, setViewerOpen] = useState(false)
 
   return (
     <Card
@@ -97,7 +101,7 @@ export default function IconAnalysisPanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              6
+              7
             </span>
             分析icon
           </span>
@@ -124,6 +128,17 @@ export default function IconAnalysisPanel() {
         </div>
       ) : iconAnalysisStatus === 'done' && analyzedIcons ? (
         <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[13px] font-bold">分析结果</span>
+            <div className="flex items-center gap-2">
+              {iconClampInfo ? (
+                <span className="text-[11px] text-black/45">{iconClampInfo}</span>
+              ) : null}
+              <Button size="small" onClick={() => setViewerOpen(true)}>
+                查看
+              </Button>
+            </div>
+          </div>
           {analyzedIcons.map((icon) => (
             <div
               key={icon.index}
@@ -170,6 +185,8 @@ export default function IconAnalysisPanel() {
           )}
         </div>
       )}
+
+      <AnalysisViewerModal open={viewerOpen} onClose={() => setViewerOpen(false)} />
     </Card>
   )
 }

@@ -162,12 +162,12 @@ export default function MidExtractPanel({
           {!canRun ? (
             <span className="px-2 text-center text-[12px] text-black/45">
               {iconBackStatus !== 'done'
-                ? '请先完成第 8 步去icon'
+                ? '请先完成第 9 步去icon'
                 : `检测结果中没有 ${category}`}
             </span>
           ) : (
             <span className="text-[12px] text-black/45">
-              将从去icon图提取 {count} 个 {category}（或在第 8 步一键"提取中景层"）
+              将从去icon图提取 {count} 个 {category}（或在第 9 步一键"提取中景层"）
             </span>
           )}
         </div>

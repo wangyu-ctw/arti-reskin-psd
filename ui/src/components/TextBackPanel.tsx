@@ -1,4 +1,4 @@
-import { App, Button, Card, Input, InputNumber, Popover, Spin, Upload } from 'antd'
+import { App, Button, Card, Checkbox, Input, InputNumber, Popover, Spin, Upload } from 'antd'
 import { SettingOutlined, UploadOutlined } from '@ant-design/icons'
 import {
   DEFAULT_TEXT_BACK_PROMPT,
@@ -8,8 +8,20 @@ import {
 const { TextArea } = Input
 
 function SettingsPopover() {
-  const { textBackPrompt, textBackSeed, textBackSteps, setField } =
-    useDetectionStore()
+  const {
+    runInfo,
+    textBackPrompt,
+    textBackSeed,
+    textBackSteps,
+    textBackProtect,
+    textBackProtectGrow,
+    setField,
+  } = useDetectionStore()
+  const seekHref = `/seedseek?task=text_back${
+    runInfo
+      ? `&img=${encodeURIComponent(`/api/runs/${runInfo.run_id}/files/origin.png`)}`
+      : ''
+  }`
 
   return (
     <Popover
@@ -49,6 +61,30 @@ function SettingsPopover() {
               />
             </div>
           </div>
+          <div className="flex items-center gap-2">
+            <Checkbox
+              checked={textBackProtect}
+              onChange={(e) => setField('textBackProtect', e.target.checked)}
+            >
+              <span className="text-[12px]">
+                保护合成（仅文字框内取重生成像素，icon 不会被误删）
+              </span>
+            </Checkbox>
+            <span className="text-[12px] text-black/60">外扩px</span>
+            <InputNumber
+              size="small"
+              className="w-16"
+              value={textBackProtectGrow}
+              onChange={(v) => setField('textBackProtectGrow', v ?? 8)}
+              disabled={!textBackProtect}
+              min={0}
+              max={64}
+              precision={0}
+            />
+          </div>
+          <Button size="small" href={seekHref} target="_blank">
+            找seed(新标签页打开)
+          </Button>
         </div>
       }
     >

@@ -33,7 +33,8 @@ prompt 与第 8 步推理一致,guidance 4)。产物含 checkpoint-500~3000 可�
 
 | 用途 | 路径 | 大小 | 状态 |
 |---|---|---|---|
-| SAM2(第 7/9/10/11 步抠图,decoder 微调版 step-7000,val IoU 0.890/基线 0.748) | `/workspace/outputs/sam2_train_20260805/step-7000.pt` | 857M | 在役(2026-08-05 上线) |
+| SAM2(抠图,icon 专项续训 step-1000:贴轮廓环带负点治底座误判,val icon 0.924) | `/workspace/outputs/sam2_icon_20260805/step-1000.pt` | 857M | 在役(2026-08-05 二次上线) |
+| SAM2 全类均衡版(step-7000,val IoU 0.890/基线 0.748) | `/workspace/outputs/sam2_train_20260805/step-7000.pt` | 857M | 回退备份 |
 | SAM2 官方原版 sam2.1_hiera_large | `/workspace/sam2/checkpoints/sam2.1_hiera_large.pt` | 857M | 回退备份(sam2d.sh 删掉 SAM2_CHECKPOINT 行即回退) |
 | YOLO 检测(第 3 步,11m 新数据版 game0804,mAP50 0.752) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt` | 39M | 在役(2026-08-05 三版对比后定版) |
 | YOLO 旧 P2(game0728_p2) | `/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt` | 42M | 回退/对比备份 |

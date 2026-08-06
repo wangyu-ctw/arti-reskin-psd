@@ -50,7 +50,13 @@ function SettingsPopover() {
   const iconBackPrompt = useDetectionStore((s) => s.iconBackPrompt)
   const iconBackFillHoles = useDetectionStore((s) => s.iconBackFillHoles)
   const iconBackStatus = useDetectionStore((s) => s.iconBackStatus)
+  const runInfo = useDetectionStore((s) => s.runInfo)
   const setField = useDetectionStore((s) => s.setField)
+  const seekHref = `/seedseek?task=fill_icon${
+    runInfo
+      ? `&img=${encodeURIComponent(`/api/runs/${runInfo.run_id}/files/text_back.png`)}`
+      : ''
+  }`
 
   return (
     <Popover
@@ -125,6 +131,9 @@ function SettingsPopover() {
               自动封闭 mask 内部孔洞（消灭 icon 残片；镂空处也会一并重绘）
             </span>
           </Checkbox>
+          <Button size="small" href={seekHref} target="_blank">
+            找seed(新标签页打开)
+          </Button>
         </div>
       }
     >
@@ -156,7 +165,7 @@ export default function IconBackPanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              8
+              9
             </span>
             去icon
           </span>
@@ -212,7 +221,7 @@ export default function IconBackPanel() {
           </Button>
           {!canRun ? (
             <span className="text-[12px] text-black/45">
-              请先完成第 7 步提icon
+              请先完成第 8 步提icon
             </span>
           ) : null}
         </div>

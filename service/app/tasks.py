@@ -116,11 +116,53 @@ def handle_hello(payload: dict) -> dict:
     return result
 
 
+def _build_text_protect_mask(run_dir: Path, size: tuple, grow: int,
+                             feather: float, conf_min: float):
+    """保护合成 mask(白=文字区,取 Kontext 重生成像素;黑=非文字区,保留原图像素)。
+
+    用 YOLO text 框圈出文字区并外扩;icon 等非文字元素落在黑区,物理上不会被改动。
+    检测结果顺手写 yolo.txt 留档(与 handle_yolo 同格式)。
+    """
+    det = yoloc.detect({
+        "dir": str(run_dir), "image": "origin.png",
+        "imgsz": 1600, "conf": 0.05, "iou": 0.7,
+        "augment": False, "slice": False, "slice_size": 640,
+    })
+    lines = det.get("lines", [])
+    (run_dir / "yolo.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    tw, th = size
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    used = 0
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "0":
+            continue
+        conf = float(parts[5]) if len(parts) > 5 else 1.0
+        if conf < conf_min:
+            continue
+        cx, cy, w, h = (float(v) for v in parts[1:5])
+        draw.rectangle(
+            [(cx - w / 2) * tw - grow, (cy - h / 2) * th - grow,
+             (cx + w / 2) * tw + grow, (cy + h / 2) * th + grow],
+            fill=255)
+        used += 1
+    if feather > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(feather))
+    return mask, used
+
+
 def handle_text_back(payload: dict) -> dict:
     """去字模型(常驻 ComfyUI 版):读 <run_dir>/origin.png,输出 <run_dir>/text_back.png。
 
     payload: run_id(必填,或用 dir 直接指定目录)、seed、steps、prompt、
              max_pixels、guidance、lora(均可选)。
+             protect(默认 True):保护合成——只有 YOLO text 框内取重生成像素,
+             其余保留原图,icon 物理上不可能被误删;
+             protect_grow(默认 8)文字框外扩 px、protect_feather(默认 4)边缘羽化、
+             protect_conf(默认 0.2)text 框置信度门槛(太低的框不给重生成权,
+             防止误检的"假文字"框让 icon 失去保护)。
     """
     run_dir = _resolve_run_dir(payload)
     origin = run_dir / "origin.png"
@@ -149,10 +191,29 @@ def handle_text_back(payload: dict) -> dict:
                            f"(prompt_id={entry.get('prompt_id')})")
 
     output_path = run_dir / "text_back.png"
-    shutil.copyfile(images[0], output_path)
+    protect = bool(payload.get("protect", True))
+    protected_boxes = None
+    if protect:
+        mask, protected_boxes = _build_text_protect_mask(
+            run_dir, (tw, th),
+            grow=int(payload.get("protect_grow", 8)),
+            feather=float(payload.get("protect_feather", 4)),
+            conf_min=float(payload.get("protect_conf", 0.2)))
+        with Image.open(images[0]) as g:
+            gen = g.convert("RGB")
+            if gen.size != (tw, th):
+                gen = gen.resize((tw, th), Image.Resampling.LANCZOS)
+        with Image.open(origin) as o:
+            base = o.convert("RGB").resize((tw, th), Image.Resampling.LANCZOS)
+        # mask 白区取重生成像素,黑区保留原图像素
+        Image.composite(gen, base, mask).save(output_path)
+    else:
+        shutil.copyfile(images[0], output_path)
     return {
         "output_path": str(output_path),
         "size": [tw, th],
+        "protect": protect,
+        "protected_text_boxes": protected_boxes,
         "prompt_id": entry.get("prompt_id"),
         "elapsed_sec": round(time.time() - started, 1),
     }
@@ -457,6 +518,11 @@ def handle_mid_hole(payload: dict) -> dict:
         sources        要挖掉的图层,默认 ["assets.png", "bar.png", "button.png"],
                        不存在的自动跳过(至少要有一个存在)
         output         输出文件名,默认 mid_hole.png
+        grow           洞外扩(腐蚀保留区)像素,默认 0:洞按各层 alpha 原样挖;
+                       >0 时洞向外多挖 N 像素,吃掉元素边缘残留
+        fill_rgb       可选 [r,g,b]:洞内 RGB 也替换为该色(alpha 仍为 0)。
+                       串行提取的中间图必须传(如 [0,0,0]),否则 SAM2 通过 RGB
+                       仍能"看见"已移除的元素,起不到排除干扰的作用
     """
     if payload.get("dir"):
         run_dir = Path(payload["dir"])
@@ -490,7 +556,16 @@ def handle_mid_hole(payload: dict) -> dict:
         raise FileNotFoundError(
             f"没有可用的中景层图({'/'.join(sources)} 均不存在),请先完成提取")
 
+    grow = int(payload.get("grow", 0))
+    if grow > 0:
+        # 腐蚀保留区 = 洞向外扩 grow 像素
+        keep = keep.filter(ImageFilter.MinFilter(size=2 * grow + 1))
     base.putalpha(ImageChops.darker(base.getchannel("A"), keep))
+    fill_rgb = payload.get("fill_rgb")
+    if fill_rgb:
+        hole_mask = keep.point(lambda v: 255 if v == 0 else 0)
+        base.paste((int(fill_rgb[0]), int(fill_rgb[1]), int(fill_rgb[2]), 0),
+                   mask=hole_mask)
     output_path = run_dir / (payload.get("output") or "mid_hole.png")
     base.save(output_path, format="PNG")
     return {

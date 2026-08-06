@@ -24,8 +24,18 @@ def _http(method: str, path: str, payload: dict = None, timeout: float = 30) -> 
         headers={"Content-Type": "application/json"},
         method=method,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # daemon 把 traceback 放在错误响应体里,透传出来,否则只剩一个干瘪的 500
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+            body = json.loads(body).get("error", body)
+        except Exception:
+            pass
+        raise RuntimeError(f"sam2 daemon HTTP {e.code}: {body[-2000:]}") from None
 
 
 def is_up() -> bool:

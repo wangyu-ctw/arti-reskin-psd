@@ -1,6 +1,5 @@
-import { useState, type CSSProperties } from 'react'
+import type { CSSProperties } from 'react'
 import { Button, Card, Checkbox, InputNumber, Popover, Select, Spin } from 'antd'
-import GreenCompareModal from './GreenCompareModal'
 import { SettingOutlined } from '@ant-design/icons'
 import {
   useDetectionStore,
@@ -178,11 +177,8 @@ export default function IconExtractPanel() {
     analyzedIcons,
     iconImageUrl,
     iconError,
-    apiKey,
     runExtractIcons,
   } = useDetectionStore()
-
-  const [greenCompareOpen, setGreenCompareOpen] = useState(false)
 
   const useAnalyzed = Boolean(analyzedIcons?.length)
   const iconCount = useAnalyzed
@@ -202,18 +198,11 @@ export default function IconExtractPanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              7
+              8
             </span>
             提icon
           </span>
           <div className="flex items-center gap-2">
-            <Button
-              size="small"
-              disabled={!apiKey.trim() || iconCount === 0 || textBackStatus !== 'done'}
-              onClick={() => setGreenCompareOpen(true)}
-            >
-              绿底对比
-            </Button>
             {iconStatus === 'done' ? (
               <Button
                 size="small"
@@ -270,16 +259,11 @@ export default function IconExtractPanel() {
           ) : (
             <span className="text-[12px] text-black/45">
               将以「{sourceLabel}」提取 {iconCount} 个 icon
-              {useAnalyzed ? '（使用第 6 步分析后的框和正负点）' : '（未分析，使用原始检测框）'}
+              {useAnalyzed ? '（使用第 7 步分析后的框和正负点）' : '（未分析，使用原始检测框）'}
             </span>
           )}
         </div>
       )}
-
-      <GreenCompareModal
-        open={greenCompareOpen}
-        onClose={() => setGreenCompareOpen(false)}
-      />
     </Card>
   )
 }

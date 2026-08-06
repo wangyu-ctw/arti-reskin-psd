@@ -92,9 +92,21 @@ def make_example(rec: dict, rng: random.Random):
     idx = [rng.randrange(len(ys)) for _ in range(n_pos)]
     pos = [(float(xs[i]), float(ys[i])) for i in idx]
 
-    # 负点:box 内 mask 外优先,补框外环带
+    # 负点:三个来源混采——
+    # ① 贴轮廓环带(mask 外 ~3px):底座月牙、衬圈、暗色背环所在区,专治"icon 连底座整块被抠";
+    #    每个样本保底 1~3 个,让 decoder 学会"紧贴轮廓外侧的像素不属于目标"
+    # ② box 内 mask 外(圆角/菱形空隙)
+    # ③ 框外紧邻环带
     neg = []
-    n_neg = rng.randint(3, 6)
+    n_neg = rng.randint(4, 7)
+    contour_ring = np.asarray(
+        Image.fromarray(mask.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(7))) > 127
+    contour_ring &= ~mask
+    ry, rx = np.nonzero(contour_ring)
+    if len(ry):
+        for _ in range(min(len(ry), rng.randint(1, 3))):
+            i = rng.randrange(len(ry))
+            neg.append((float(rx[i]), float(ry[i])))
     for _ in range(n_neg * 8):
         if len(neg) >= n_neg:
             break
@@ -187,18 +199,27 @@ def main() -> None:
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--val-cap", type=int, default=400)
     ap.add_argument("--out", type=Path, default=Path("/workspace/outputs/sam2_train_20260805"))
+    ap.add_argument("--classes", default="",
+                    help="逗号分隔,只用这些类的实例训练(验证集始终全类,便于监控其他类回退)")
+    ap.add_argument("--init", default=CKPT,
+                    help="起点权重,可指向已微调的检查点续训")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
     recs = [json.loads(l) for l in open(DATA / "annotations.jsonl", encoding="utf-8")]
     train_recs = [r for r in recs if not Path(r["image"]).name.startswith(VAL_PREFIX)]
+    if args.classes:
+        wanted = {c.strip() for c in args.classes.split(",") if c.strip()}
+        train_recs = [r for r in train_recs if r["class"] in wanted]
+        print(f"类过滤 {sorted(wanted)}: 训练实例 {len(train_recs)}", flush=True)
     val_recs = [r for r in recs if Path(r["image"]).name.startswith(VAL_PREFIX)]
     rng_val = random.Random(7)
     rng_val.shuffle(val_recs)
     val_recs = val_recs[: args.val_cap]
     print(f"train {len(train_recs)} / val {len(val_recs)} instances", flush=True)
 
-    model = build_sam2(CFG, CKPT, device="cuda")
+    model = build_sam2(CFG, args.init, device="cuda")
+    print(f"init from: {args.init}", flush=True)
     predictor = SAM2ImagePredictor(model)
     for p in model.parameters():
         p.requires_grad = False

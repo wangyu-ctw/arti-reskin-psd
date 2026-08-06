@@ -50,7 +50,13 @@ function SettingsPopover() {
   const midFillPrompt = useDetectionStore((s) => s.midFillPrompt)
   const midFillFillHoles = useDetectionStore((s) => s.midFillFillHoles)
   const midFillStatus = useDetectionStore((s) => s.midFillStatus)
+  const runInfo = useDetectionStore((s) => s.runInfo)
   const setField = useDetectionStore((s) => s.setField)
+  const seekHref = `/seedseek?task=fill_mid${
+    runInfo
+      ? `&img=${encodeURIComponent(`/api/runs/${runInfo.run_id}/files/icon_back.png`)}`
+      : ''
+  }`
 
   return (
     <Popover
@@ -125,6 +131,9 @@ function SettingsPopover() {
               自动封闭 mask 内部孔洞（消灭元素残片；镂空处也会一并重绘）
             </span>
           </Checkbox>
+          <Button size="small" href={seekHref} target="_blank">
+            找seed(新标签页打开)
+          </Button>
         </div>
       }
     >
@@ -153,7 +162,7 @@ export default function MidFillPanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              13
+              14
             </span>
             修补
           </span>
@@ -199,7 +208,7 @@ export default function MidFillPanel() {
           </Button>
           {!canRun ? (
             <span className="text-[12px] text-black/45">
-              请先完成第 12 步中景层破洞图
+              请先完成第 13 步中景层破洞图
             </span>
           ) : null}
         </div>

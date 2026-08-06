@@ -6,26 +6,28 @@
   },
   "textBack": {
     "prompt": "Remove all letters, words, and numbers from the game UI and reconstruct the clean UI underneath. Keep every icon, symbol, button, border, and non-text graphic unchanged.",
-    "seed": 5,
+    "seed": 31,
     "steps": 20
   },
   "iconAnalysis": {
     "model": "google/gemini-3.1-pro-preview",
     "models": [
       "google/gemini-3.1-pro-preview",
-      "qwen/qwen3-vl-235b-a22b-instruct"
+      "qwen/qwen3-vl-235b-a22b-instruct",
+      "google/gemini-3.6-flash",
+      "google/gemini-2.5-pro"
     ],
-    "temperature": 0.1,
-    "systemPrompt": "你是一名游戏 UI 图标分析专家。用户会提供一张已去除文字的游戏 UI 图片，以及一组 icon 检测框（归一化 YOLO 格式 [center_x, center_y, width, height]，数值 0～1）。检测框本身视为正确，不需要核对或修正轮廓。请逐一分析每个检测框：\n1. description：一句话说明这个 icon 是什么图形（如\"齿轮设置图标\"\"圆形关闭按钮，内含 X\"）；\n2. positive_points：1～3 个正点，用于告诉分割模型\"这里属于 icon\"。硬性要求：\n   - 必须落在 icon 的实体像素上（有颜色的图形本体），首选图形最粗壮、最实心的部位；\n   - 严禁落在镂空处、透明缝隙、图形内部露出的背景色上——环形、勾形、X 形图标要把点放在笔画上，而不是几何中心；\n   - 与图形边缘保持距离：离最近的轮廓边至少留出 icon 宽高的 10%，不要贴边；\n   - 多个正点应分散在图形的不同部位，不要挤在一起。\n3. negative_points：6～10 个负点，用于告诉分割模型\"这里不是 icon\"。把名额尽量用满——负点越多，分割边界越准；只有确实找不到合法落点时才允许少于 8 个，且绝不为凑数把点压到 icon 上。硬性要求：\n   - 首要任务是排除\"框内但不属于 icon\"的区域：检测框是图形的外接矩形，圆形、菱形、斜切、不规则图形不会填满四角——凡是图形没有填满外接矩形的，必须优先在框内的空角处放负点（通常是四个角落各一个）；图形哪边有空隙，负点就补到哪；\n   - 底座剥离：icon 经常骑在底板的圆形底座、凹槽或暗色衬圈上（典型如资源栏端头的钱币/钻石位、按钮上的图标座）。底座属于底板，不属于 icon——凡是 icon 轮廓之外露出的底座月牙、衬圈、暗色背环，必须放 1～2 个负点压住，把 icon 与底座干净切开；识别方法：紧贴图形轮廓外侧、颜色明显更暗或与底板同色的环状/月牙状区域就是底座；\n   - 剩余名额放在框外紧邻处（距框边约 icon 宽高的 5%～15%），分布在不同方向形成包夹；\n   - 每个负点都必须落在背景、底板或面板的像素上；严禁落在 icon 自身的任何部分，包括描边、外发光、投影、角标；\n   - 严禁落在相邻的其他 icon、文字或按钮上；\n   - 忽略\"仮\"字角标：它是占位标记，正负点都不要落在它上面；\n   - 坐标必须在 0～1 图像范围内，超出图像边界的方向就放弃、换其他位置补足。\n你的职责仅限于：识别 icon 含义、给出正负点。不需要判断轮廓准确性，也不需要判断 icon 是否\"有用\"——所有输入框都会按原样被保留使用。\n输出项数量、顺序必须与输入框一一对应（index 从 0 计）。所有坐标归一化 0～1。只输出符合 JSON Schema 的结果。",
+    "temperature": 0,
+    "systemPrompt": "你是一名游戏 UI 图标分析专家。用户会提供一张已去除文字的游戏 UI 图片，以及一组 icon 检测框（归一化 YOLO 格式 [center_x, center_y, width, height]，数值 0～1）。检测框本身视为正确，不需要核对或修正轮廓。请逐一分析每个检测框：\n1. description：一句话说明这个 icon 是什么图形（如\"齿轮设置图标\"\"圆形关闭按钮，内含 X\"）；\n2. positive_points：1～3 个正点，用于告诉分割模型\"这里属于 icon\"。硬性要求：\n   - 必须落在 icon 的实体像素上（有颜色的图形本体），首选图形最粗壮、最实心的部位；\n   - 严禁落在镂空处、透明缝隙、图形内部露出的背景色上——环形、勾形、X 形图标要把点放在笔画上，而不是几何中心；\n   - 与图形边缘保持距离：离最近的轮廓边至少留出 icon 宽高的 10%，不要贴边；\n   - 多个正点应分散在图形的不同部位，不要挤在一起。\n3. negative_points：6～10 个负点，用于告诉分割模型\"这里不是 icon\"。把名额尽量用满——负点越多，分割边界越准；只有确实找不到合法落点时才允许少于 8 个，且绝不为凑数把点压到 icon 上。输出每个负点坐标之前，先在脑内核对一次：该坐标处的像素属于 icon 本体（图形、描边、投影、角标）还是背景/底座/空隙？属于本体就立刻换位置——没有第二遍校验的机会，一次要放对。硬性要求：\n   - 禁止模板化撒点：严禁机械地把负点摆成\"四角+四边中点\"的选择框模板——那等于没看图。每个负点都必须基于图像内容选位：放点前先确认该位置的像素属于什么（底座？背景？面板？），说不出来就不要放在那里；\n   - 第一优先级是框内的非 icon 像素，按\"紧贴图形轮廓、可见面积大\"排序：底座月牙/衬圈/暗色背环 ＞ 图形与框边之间的空隙带 ＞ 圆形/菱形图形的空角。空角只是候选之一，不是默认答案——图形几乎填满的角落不要放点；图形哪边露出非 icon 像素，负点就补到哪边；\n   - 角点取点域限制：凡是图案没有占用的角，该角的负点必须取自 bbox 内部——贴着这个角的内侧、图形轮廓之外的空隙里，严禁把角点甩到框外去（框外角落是别人的地盘，压不住框内的空角像素）。同时，角点严禁落入\"四边中点连线\"围成的中央菱形区内：把 bbox 上下左右四条边的中点两两相连得到一个内接菱形，菱形内部是图形主体的地盘，角点只能落在菱形之外的四个角落三角区里——越靠近角、离图形越远越安全；\n   - 底座剥离：icon 经常骑在底板的圆形底座、凹槽或暗色衬圈上（典型如资源栏端头的钱币/钻石位、按钮上的图标座）。底座属于底板，不属于 icon——凡是 icon 轮廓之外露出的底座月牙、衬圈、暗色背环，必须放 1～2 个负点压住，把 icon 与底座干净切开；识别方法：紧贴图形轮廓外侧、颜色明显更暗或与底板同色的环状/月牙状区域就是底座；\n   - 光效剥离：icon 类资产一般不带光效——这是它与 assets 的重要区分（assets 的底座、影子、光效随本体保留，icon 不是）。图形轮廓外的外发光、光晕、闪光粒子都不属于 icon，应在紧贴轮廓外的光效区域放 1～2 个负点把它切出去；注意实心描边（勾边线）仍属于 icon 本体，不要把负点压到描边上；\n   - 四边中点方向（上、下、左、右）的包夹点强制取在框外（距框边约 icon 宽高的 5%～15%），严禁落在 bbox 内部；角落方向的点则一律按上条走框内。两类点各守各的域：角点在内、边点在外。框外点数不得超过负点总数的一半——框内的底座、衬圈、空隙永远优先于框外包夹；\n   - 每个负点都必须落在背景、底板或面板的像素上；严禁落在 icon 自身的任何部分，包括描边、投影、角标（注意：外发光不算 icon 自身，见下条\"光效剥离\"）；\n   - 严禁落在相邻的其他 icon、文字或按钮上；\n   - 忽略\"仮\"字角标：它是占位标记，正负点都不要落在它上面；\n   - 坐标必须在 0～1 图像范围内，超出图像边界的方向就放弃、换其他位置补足。\n你的职责仅限于：识别 icon 含义、给出正负点。不需要判断轮廓准确性，也不需要判断 icon 是否\"有用\"——所有输入框都会按原样被保留使用。\n输出项数量、顺序必须与输入框一一对应（index 从 0 计）。所有坐标归一化 0～1。只输出符合 JSON Schema 的结果。",
     "userPrompt": "请分析这张图片中的以下 icon 检测框："
   },
   "iconExtract": {
-    "smallMaxSide": 40,
-    "largeMinSide": 90,
+    "smallMaxSide": 48,
+    "largeMinSide": 96,
     "small": {
       "paddingRatio": 0.01,
       "minPadding": 1,
-      "maskThreshold": 0.35,
+      "maskThreshold": 0.55,
       "featherRadius": 1,
       "cropScale": 2.5
     },
@@ -39,7 +41,7 @@
     "large": {
       "paddingRatio": 0.03,
       "minPadding": 4,
-      "maskThreshold": 0.55,
+      "maskThreshold": 0.35,
       "featherRadius": 2,
       "cropScale": 1.2
     },
@@ -48,7 +50,7 @@
     "fillHoles": true
   },
   "assetsExtract": {
-    "paddingRatio": 0.06,
+    "paddingRatio": 0.03,
     "minPadding": 3,
     "maskThreshold": 0.7,
     "featherRadius": 2,
@@ -78,11 +80,11 @@
     "fillHoles": true
   },
   "iconBack": {
-    "prompt": "Inpaint the masked holes. Critical rule: the holes are arbitrary cutout silhouettes left by removed icons — the SHAPE of a hole carries zero information about what should be painted inside it. Never draw anything that follows, echoes, outlines or is centered on the hole shape. Do not invent any new motif, emblem, ornament, pattern piece or shape inside a hole.\nReconstruction priority — color first, pattern second: sample the colors immediately adjacent to each hole's edge (the pixels that directly touch the boundary) and extend them inward with smooth, seamless blending; this nearest-color continuation is the default and dominant behavior. Whenever color evidence and pattern evidence conflict, follow the color. Only continue a line, border or stripe if it visibly touches the hole boundary and obviously needs to reconnect on the other side — keep its direction, thickness and spacing, nothing more. Never import or repeat patterns, ornaments or motifs from nearby panels or other parts of the image: anything that does not directly touch the hole's edge is irrelevant. When in doubt, fill with the plain color or gradient of the immediately surrounding surface and nothing else.\nNo icons, no symbols, no logos, no badges, no text, no letters, no numbers. Keep everything outside the masked holes exactly unchanged.",
-    "seed": 9,
+    "prompt": "Inpaint the masked holes. Critical rule: the holes are arbitrary cutout silhouettes left by removed icons — the SHAPE of a hole carries zero information about what should be painted inside it. Never draw anything that follows, echoes, outlines or is centered on the hole shape. Do not invent any new motif, emblem, ornament, pattern piece or shape inside a hole.\nReconstruction priority — color first, pattern second: sample the colors immediately adjacent to each hole's edge (the pixels that directly touch the boundary) and extend them inward with smooth, seamless blending; this nearest-color continuation is the default and dominant behavior. Whenever color evidence and pattern evidence conflict, follow the color. Only continue a line, border or stripe if it visibly touches the hole boundary and obviously needs to reconnect on the other side — keep its direction, thickness and spacing, nothing more. Edge sharpness is critical: game UI borders and panel frames are crisp, hard-edged, vector-like graphics. When a panel border, frame line, corner ornament or divider passes through a hole, redraw it with clean sharp edges — exact thickness, perfectly straight or smoothly curved as the visible continuation demands, with hard color transitions identical to the neighboring intact segments. Never leave blurry, smudged or watercolor-soft edges inside the repaired area; a blurred border is a failed repair. Never import or repeat patterns, ornaments or motifs from nearby panels or other parts of the image: anything that does not directly touch the hole's edge is irrelevant. When in doubt, fill with the plain color or gradient of the immediately surrounding surface and nothing else.\nNo icons, no symbols, no logos, no badges, no text, no letters, no numbers. Keep everything outside the masked holes exactly unchanged.",
+    "seed": 33,
     "steps": 20,
     "guidance": 4,
-    "growMask": 5,
+    "growMask": 1,
     "maskBlur": 4,
     "maxPixels": 1048576,
     "fillHoles": true

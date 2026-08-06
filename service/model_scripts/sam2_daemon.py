@@ -136,9 +136,12 @@ def cutout(req: dict) -> dict:
         if not alt_path.is_file():
             raise FileNotFoundError(f"alt image not found: {alt_path}")
         with Image.open(alt_path) as im:
-            alt_arr = np.asarray(ImageOps.exif_transpose(im).convert("RGBA"))
-        if alt_arr.shape[:2] != (height, width):
-            raise ValueError("alt_image size mismatch with image")
+            alt_im = ImageOps.exif_transpose(im).convert("RGBA")
+        if alt_im.size != (width, height):
+            # 主图(去字图)经 16 对齐限像素缩放,与原图尺寸常不一致;
+            # 归一化坐标与源图分辨率无关,重采样对齐即可
+            alt_im = alt_im.resize((width, height), Image.Resampling.LANCZOS)
+        alt_arr = np.asarray(alt_im)
         alt_rgb = np.ascontiguousarray(alt_arr[:, :, :3])
         alt_alpha = alt_arr[:, :, 3]
 
@@ -330,7 +333,9 @@ class Handler(BaseHTTPRequestHandler):
                 result = cutout(req)
             self._send(200, result)
         except Exception:
-            self._send(500, {"error": traceback.format_exc()[-3000:]})
+            tb = traceback.format_exc()
+            print(f"[cutout error]\n{tb}", flush=True)  # 落盘到 daemon 日志,便于事后排查
+            self._send(500, {"error": tb[-3000:]})
 
     def log_message(self, fmt, *args):
         print(f"{self.address_string()} {fmt % args}", flush=True)
