@@ -29,6 +29,8 @@ export type TaskType =
   | 'omnipsd'
   | 'yolo'
   | 'sam2'
+  | 'icon_repair'
+  | 'icon_asset'
 
 async function toJson<T>(res: Response): Promise<T> {
   if (!res.ok) {

@@ -26,12 +26,16 @@ import {
   fetchImageAsDataUrl,
   type AnalyzedIcon,
 } from '../lib/iconAnalysis'
-import { extractTextFront } from '../lib/textFront'
+import { analyzeIconGroups, type IconGroup } from '../lib/iconGroups'
 import { clampIconPoints } from '../lib/pointClamp'
+import { extractTextFront } from '../lib/textFront'
+import { analyzeCutoutFixes, fetchImageDataUrl } from '../lib/iconRefine'
 
 export const DEFAULT_TEXT_BACK_PROMPT = stepDefaults.textBack.prompt
 
 export const DEFAULT_ICON_BACK_PROMPT = stepDefaults.iconBack.prompt
+
+export const DEFAULT_MID_FILL_PROMPT = stepDefaults.midFill.prompt
 
 // 检测结果缓存(每次成功生成后写入,面板上可一键导入)
 const RESULT_CACHE_KEY = 'gpt56-sol-image-analyzer.result.v1'
@@ -66,6 +70,9 @@ export interface IconTierParams {
   maskThreshold: number
   featherRadius: number
   cropScale: number
+  refine: boolean
+  multimask: boolean
+  fillHoles: boolean
 }
 
 // 第 9~11 步:中景层提取(assets/bar/button,从第 8 步结果图 icon_back.png 提取)
@@ -100,6 +107,8 @@ interface DetectionState {
   systemPrompt: string
   userPrompt: string
   yoloResult: string
+  // 第 3 步 YOLO 权重选择(daemon 多模型注册表的 key)
+  yoloModel: string
   isYoloRunning: boolean
   yoloError: string
   reasoningEffort: string
@@ -135,6 +144,28 @@ interface DetectionState {
   analyzedIcons: AnalyzedIcon[] | null
   // 域钳制结果说明(修正了几个越域点)
   iconClampInfo: string
+  // 第 8+ 步:素材化(分组 → 每组一张高清透明素材,Qwen 双图重绘)
+  iconGroupModel: string
+  iconGroupTemperature: number
+  iconGroupSystemPrompt: string
+  iconGroupUserPrompt: string
+  iconGroupStatus: TextBackStatus
+  iconGroupError: string
+  iconGroups: IconGroup[] | null
+  iconAssetStatus: TextBackStatus
+  iconAssetError: string
+  // 原图参照:开=双图重绘(慢 ~40% 但修复更准),关=单图
+  iconAssetUseRef: boolean
+  iconAssetSummary: string
+  // 叠放显示数据:每组素材文件与各成员回贴矩形(源图像素坐标)
+  iconAssetItems: {
+    slug: string
+    file: string
+    status: string
+    members: { member: number; paste_x: number; paste_y: number;
+               paste_w: number; paste_h: number }[]
+  }[]
+  iconAssetSourceSize: [number, number] | null
   // 第 7 步:提 icon(sam2 抠图)
   // 提icon源图:text_back=去字图 / origin=原图 / auto=双源逐 icon 按 SAM2 自评分择优
   iconSource: 'text_back' | 'origin' | 'auto'
@@ -145,12 +176,13 @@ interface DetectionState {
   iconTierParams: Record<IconTier, IconTierParams>
   iconSmallMaxSide: number
   iconLargeMinSide: number
-  iconRefine: boolean
-  iconMultimask: boolean
-  iconFillHoles: boolean
   iconStatus: TextBackStatus
   iconImageUrl: string
   iconError: string
+  // 第 8 步"修正":VL 质检抠图问题(粘连/保守),SAM2 带正负点重抠
+  iconRefineQaStatus: TextBackStatus
+  iconRefineQaError: string
+  iconRefineQaInfo: string
   // 第 8 步:去 icon(flux_fill 修补)
   iconBackPrompt: string
   iconBackSeed: number
@@ -219,7 +251,14 @@ interface DetectionState {
   ) => void
   runTextBack: () => Promise<void>
   runAnalyzeIcons: () => Promise<void>
+  /** 一键清除所有负点(走"不使用负点数据"这条路) */
+  clearNegativePoints: () => void
+  runAnalyzeGroups: () => Promise<void>
   runExtractIcons: () => Promise<void>
+  /** 内部共用:按给定 borders 执行 SAM2 提取(提取/修正共用参数装配) */
+  submitIconExtraction: (borders: Record<string, unknown>[]) => Promise<void>
+  runRefineIcons: () => Promise<void>
+  runIconAsset: () => Promise<void>
   runIconBack: () => Promise<void>
   setMidParam: <K extends keyof MidExtractParams>(
     cat: MidKey,
@@ -239,6 +278,31 @@ interface DetectionState {
 }
 
 let abortController: AbortController | null = null
+
+/** 取图片自然尺寸(浏览器缓存友好,用于分档判定) */
+function loadImageSize(url: string): Promise<[number, number]> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve([img.naturalWidth, img.naturalHeight])
+    img.onerror = () => reject(new Error('图片加载失败'))
+    img.src = url
+  })
+}
+
+/** 第 7 步分析点位的传递策略:只有小档 icon 传正点,负点及中/大档一律不传 */
+function analyzedToBorders(
+  analyzed: AnalyzedIcon[],
+  imgW: number,
+  imgH: number,
+  smallMaxSide: number,
+): Record<string, unknown>[] {
+  return analyzed.map((a) => {
+    const side = Math.max(a.bbox[2] * imgW, a.bbox[3] * imgH)
+    return side <= smallMaxSide
+      ? { bbox: a.bbox, positive_points: a.positive_points }
+      : { bbox: a.bbox }
+  })
+}
 
 function loadSavedSettings(): SavedSettings {
   try {
@@ -351,6 +415,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   systemPrompt: stepDefaults.detection.systemPrompt,
   userPrompt: stepDefaults.detection.userPrompt,
   yoloResult: '',
+  yoloModel: 'game0804_p2',
   isYoloRunning: false,
   yoloError: '',
   reasoningEffort: stepDefaults.detection.reasoningEffort,
@@ -379,6 +444,19 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   iconAnalysisError: '',
   analyzedIcons: null,
   iconClampInfo: '',
+  iconGroupModel: stepDefaults.iconGroups.model,
+  iconGroupTemperature: stepDefaults.iconGroups.temperature,
+  iconGroupSystemPrompt: stepDefaults.iconGroups.systemPrompt,
+  iconGroupUserPrompt: stepDefaults.iconGroups.userPrompt,
+  iconGroupStatus: 'idle',
+  iconGroupError: '',
+  iconGroups: null,
+  iconAssetStatus: 'idle',
+  iconAssetError: '',
+  iconAssetUseRef: false,
+  iconAssetItems: [],
+  iconAssetSourceSize: null,
+  iconAssetSummary: '',
   iconSource: 'auto',
   textFrontStatus: 'idle',
   textFrontImageUrl: '',
@@ -390,11 +468,11 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   },
   iconSmallMaxSide: stepDefaults.iconExtract.smallMaxSide,
   iconLargeMinSide: stepDefaults.iconExtract.largeMinSide,
-  iconRefine: stepDefaults.iconExtract.refine,
-  iconMultimask: stepDefaults.iconExtract.multimask,
-  iconFillHoles: stepDefaults.iconExtract.fillHoles,
   iconStatus: 'idle',
   iconImageUrl: '',
+  iconRefineQaStatus: 'idle',
+  iconRefineQaError: '',
+  iconRefineQaInfo: '',
   iconError: '',
   iconBackPrompt: stepDefaults.iconBack.prompt,
   iconBackSeed: stepDefaults.iconBack.seed,
@@ -422,14 +500,14 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   midFillStatus: 'idle',
   midFillImageUrl: '',
   midFillError: '',
-  midFillPrompt: stepDefaults.iconBack.prompt,
-  midFillSeed: stepDefaults.iconBack.seed,
-  midFillSteps: stepDefaults.iconBack.steps,
-  midFillGuidance: stepDefaults.iconBack.guidance,
-  midFillGrowMask: stepDefaults.iconBack.growMask,
-  midFillMaskBlur: stepDefaults.iconBack.maskBlur,
-  midFillMaxPixels: stepDefaults.iconBack.maxPixels,
-  midFillFillHoles: stepDefaults.iconBack.fillHoles,
+  midFillPrompt: stepDefaults.midFill.prompt,
+  midFillSeed: stepDefaults.midFill.seed,
+  midFillSteps: stepDefaults.midFill.steps,
+  midFillGuidance: stepDefaults.midFill.guidance,
+  midFillGrowMask: stepDefaults.midFill.growMask,
+  midFillMaskBlur: stepDefaults.midFill.maskBlur,
+  midFillMaxPixels: stepDefaults.midFill.maxPixels,
+  midFillFillHoles: stepDefaults.midFill.fillHoles,
   compareStatus: 'idle',
   compareImageUrl: '',
   compareError: '',
@@ -463,8 +541,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       textBackError: '',
       iconAnalysisStatus: 'idle',
       iconAnalysisError: '',
-      analyzedIcons: null,
-      iconClampInfo: '',
+      analyzedIcons: null, iconClampInfo: '', iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
       iconStatus: 'idle',
       iconImageUrl: '',
       iconError: '',
@@ -556,7 +633,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         textBackError: '',
         iconAnalysisStatus: 'idle',
         iconAnalysisError: '',
-        analyzedIcons: null,
+        analyzedIcons: null, iconClampInfo: '', iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
         iconStatus: has('icons.png') ? 'done' : 'idle',
         iconImageUrl: has('icons.png') ? fileUrl('icons.png') : '',
         textFrontStatus: has('text_front.png') ? 'done' : 'idle',
@@ -613,7 +690,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     // icon 提取仅在"从去文字图提取"模式下过期,从原图提取的结果不受影响
     set({ textBackStatus: 'running', textBackError: '',
           textFrontStatus: 'idle', textFrontImageUrl: '', textFrontError: '',
-          iconAnalysisStatus: 'idle', iconAnalysisError: '', analyzedIcons: null, iconClampInfo: '',
+          iconAnalysisStatus: 'idle', iconAnalysisError: '', analyzedIcons: null, iconClampInfo: '', iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
           iconBackStatus: 'idle', iconBackImageUrl: '', iconBackError: '',
           ...(get().iconSource === 'origin'
             ? {}
@@ -683,7 +760,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       })
       // 等待期间换了图,丢弃过期结果
       if (get().runInfo?.run_id !== runInfo.run_id) return
-      // 轮廓不再由 Gemini 修正:bbox 用检测框原值回填,供下游提取使用
+      // 轮廓不再由模型修正:bbox 用检测框原值回填,供下游提取使用
       const withBbox = analyzed.map((a, i) => ({
         ...a,
         bbox: icons[a.index]?.bbox ?? icons[i]?.bbox ?? a.bbox,
@@ -705,35 +782,81 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     }
   },
 
-  runExtractIcons: async () => {
+  clearNegativePoints: () => {
+    const { analyzedIcons } = get()
+    if (!analyzedIcons?.length) return
+    set({
+      analyzedIcons: analyzedIcons.map((a) => ({ ...a, negative_points: [] })),
+      iconClampInfo: '已一键清除全部负点(提取将只用框+正点)',
+    })
+  },
+
+  runAnalyzeGroups: async () => {
     const {
       runInfo,
       structuredResult,
       textBackStatus,
-      iconStatus,
-      iconSource,
-      analyzedIcons,
-      iconTierParams,
-      iconSmallMaxSide,
-      iconLargeMinSide,
-      iconRefine,
-      iconMultimask,
-      iconFillHoles,
+      apiKey,
+      iconGroupStatus,
+      iconGroupModel,
+      iconGroupTemperature,
+      iconGroupSystemPrompt,
+      iconGroupUserPrompt,
     } = get()
-    // 有第 6 步分析结果时优先用修正后的 bbox + 正负点(跳过建议删除的装饰性 icon),
-    // 否则退回原始检测框(与第 5 步同口径,过滤 discard)
-    let borders: Record<string, unknown>[] = analyzedIcons?.length
-      ? analyzedIcons
-          .filter((a) => !a.should_delete)
-          .map((a) => ({
-            bbox: a.bbox,
-            positive_points: a.positive_points,
-            negative_points: a.negative_points,
-          }))
-      : pickDetections(structuredResult, 'icon')
-    if (!runInfo || borders.length === 0) return
+    const icons = pickDetections(structuredResult, 'icon')
+    if (!runInfo || textBackStatus !== 'done' || icons.length === 0) return
+    if (iconGroupStatus === 'running') return
+    if (!apiKey.trim()) {
+      set({ iconGroupStatus: 'error',
+            iconGroupError: '请先在第 2 步填写 OpenRouter API Key' })
+      return
+    }
+    set({ iconGroupStatus: 'running', iconGroupError: '' })
+    try {
+      const imageDataUrl = await fetchImageAsDataUrl(
+        `/api/runs/${runInfo.run_id}/files/text_back.png`,
+      )
+      const groups = await analyzeIconGroups({
+        apiKey: apiKey.trim(),
+        model: iconGroupModel.trim(),
+        temperature: iconGroupTemperature,
+        systemPrompt: iconGroupSystemPrompt,
+        userPrompt: iconGroupUserPrompt,
+        imageDataUrl,
+        icons,
+      })
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({ iconGroupStatus: 'done', iconGroups: groups })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        iconGroupStatus: 'error',
+        iconGroupError: error instanceof Error ? error.message : '分组失败',
+      })
+    }
+  },
+
+  runExtractIcons: async () => {
+    const { runInfo, structuredResult, textBackStatus, iconStatus, iconSource } = get()
+    // 有第 7 步分析结果时:只有小档 icon 传正点,负点及中/大档一律不传;
+    // 无分析结果退回原始检测框(与第 5 步同口径,过滤 discard)
+    const { analyzedIcons, iconSmallMaxSide } = get()
+    if (!runInfo) return
     // 涉及去文字图的模式(text_back / auto)需要第 2 步已出结果;纯原图不需要
     if (iconSource !== 'origin' && textBackStatus !== 'done') return
+    let borders: Record<string, unknown>[]
+    if (analyzedIcons?.length) {
+      const srcName = iconSource === 'origin' ? 'origin.png' : 'text_back.png'
+      const [iw, ih] = await loadImageSize(
+        `/api/runs/${runInfo.run_id}/files/${srcName}`,
+      )
+      borders = analyzedToBorders(analyzedIcons, iw, ih, iconSmallMaxSide)
+    } else {
+      borders = pickDetections(structuredResult, 'icon').map((d) => ({
+        bbox: d.bbox,
+      }))
+    }
+    if (borders.length === 0) return
     if (iconSource === 'auto') {
       // 双源择优:被文字压住的 icon 锁定去字图(原图上的文字像素会污染候选),
       // 其余逐 icon 由 SAM2 自评分在去字图/原图间择优
@@ -745,17 +868,35 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       }))
     }
     if (iconStatus === 'running') return
+    // 手动重新提取后,上一轮质检结论过期
+    set({ iconRefineQaStatus: 'idle', iconRefineQaError: '', iconRefineQaInfo: '' })
+    await get().submitIconExtraction(borders)
+  },
+
+  submitIconExtraction: async (borders) => {
+    const {
+      runInfo,
+      iconSource,
+      iconTierParams,
+      iconSmallMaxSide,
+      iconLargeMinSide,
+    } = get()
+    if (!runInfo || borders.length === 0) return
     // icon 重新提取后,旧的去 icon 结果已过期
     set({ iconStatus: 'running', iconError: '',
           iconBackStatus: 'idle', iconBackImageUrl: '', iconBackError: '' })
     try {
       // 中档 = 全局默认;小/大档以 size_rules 按像素长边覆盖
+      // (二轮精化/多候选/封孔也随档位走)
       const toRule = (p: IconTierParams) => ({
         padding_ratio: p.paddingRatio,
         min_padding: p.minPadding,
         mask_threshold: p.maskThreshold,
         feather_radius: p.featherRadius,
         crop_scale: p.cropScale,
+        refine: p.refine,
+        multimask: p.multimask,
+        fill_holes: p.fillHoles,
       })
       const { task_id } = await submitTask('sam2', runInfo.run_id, {
         image: iconSource === 'origin' ? 'origin.png' : 'text_back.png',
@@ -767,9 +908,6 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
           { max_side: iconSmallMaxSide, ...toRule(iconTierParams.small) },
           { min_side: iconLargeMinSide, ...toRule(iconTierParams.large) },
         ],
-        refine: iconRefine,
-        multimask: iconMultimask,
-        fill_holes: iconFillHoles,
       })
       await waitTask(task_id, { intervalMs: 2000 })
       // 等待期间换了图,丢弃过期结果
@@ -783,6 +921,129 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       set({
         iconStatus: 'error',
         iconError: error instanceof Error ? error.message : '提取失败',
+      })
+    }
+  },
+
+  runRefineIcons: async () => {
+    const {
+      runInfo,
+      structuredResult,
+      iconStatus,
+      iconSource,
+      apiKey,
+      iconRefineQaStatus,
+    } = get()
+    const icons = pickDetections(structuredResult, 'icon')
+    if (!runInfo || iconStatus !== 'done' || icons.length === 0) return
+    if (iconRefineQaStatus === 'running') return
+    if (!apiKey.trim()) {
+      set({ iconRefineQaStatus: 'error',
+            iconRefineQaError: '请先在第 2 步填写 OpenRouter API Key' })
+      return
+    }
+    set({ iconRefineQaStatus: 'running', iconRefineQaError: '', iconRefineQaInfo: '' })
+    try {
+      const srcName = iconSource === 'origin' ? 'origin.png' : 'text_back.png'
+      // 抠图结果透明区平铺品红,让质检模型能"看见"哪些被抠掉了
+      const [sourceDataUrl, cutoutDataUrl] = await Promise.all([
+        fetchImageDataUrl(`/api/runs/${runInfo.run_id}/files/${srcName}`),
+        fetchImageDataUrl(`/api/runs/${runInfo.run_id}/files/icons.png`, [255, 0, 255]),
+      ])
+      const fixes = await analyzeCutoutFixes({
+        apiKey: apiKey.trim(),
+        sourceDataUrl,
+        cutoutDataUrl,
+        icons,
+      })
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      if (fixes.length === 0) {
+        set({ iconRefineQaStatus: 'done',
+              iconRefineQaInfo: '质检通过:未发现需要修正的 icon' })
+        return
+      }
+      // 全量重抠:有修正的 icon 换上修正框+修正点(质检看的是当前结果,
+      // 其点位优先);其余按第 7 步传点策略(仅小档正点)或 box-only
+      const { analyzedIcons, iconSmallMaxSide } = get()
+      const fixMap = new Map(fixes.map((f) => [f.index, f]))
+      let base: Record<string, unknown>[]
+      if (analyzedIcons?.length) {
+        const [iw, ih] = await loadImageSize(
+          `/api/runs/${runInfo.run_id}/files/${srcName}`,
+        )
+        base = analyzedToBorders(analyzedIcons, iw, ih, iconSmallMaxSide)
+      } else {
+        base = icons.map((d) => ({ bbox: d.bbox }))
+      }
+      let borders: Record<string, unknown>[] = base.map((b, i) => {
+        const f = fixMap.get(i)
+        return f
+          ? { bbox: f.bbox,
+              positive_points: f.positive_points,
+              negative_points: f.negative_points }
+          : b
+      })
+      if (iconSource === 'auto') {
+        const texts = pickDetections(structuredResult, 'text')
+        borders = borders.map((b) => ({
+          ...b,
+          source:
+            detectOverlay([b as never], texts).length > 0 ? 'primary' : 'auto',
+        }))
+      }
+      set({
+        iconRefineQaInfo:
+          `修正 ${fixes.length} 个：` +
+          fixes.map((f) => `#${f.index} ${f.issue}`).join('；'),
+      })
+      await get().submitIconExtraction(borders)
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({ iconRefineQaStatus: 'done' })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        iconRefineQaStatus: 'error',
+        iconRefineQaError: error instanceof Error ? error.message : '修正失败',
+      })
+    }
+  },
+
+  runIconAsset: async () => {
+    const { runInfo, iconGroups, iconStatus, iconAssetStatus } = get()
+    if (!runInfo || !iconGroups?.length) return
+    if (iconStatus !== 'done') return // 需要 icons.png(提icon完成)
+    if (iconAssetStatus === 'running') return
+    set({ iconAssetStatus: 'running', iconAssetError: '' })
+    try {
+      const task = await submitTask('icon_asset', runInfo.run_id, {
+        groups: iconGroups.map((g) => ({
+          name: g.name, slug: g.slug, bbox: g.bbox,
+        })),
+        use_ref: get().iconAssetUseRef,
+      })
+      const result = (await waitTask(task.task_id)) as {
+        count?: number
+        ok?: number
+        statuses?: Record<string, number>
+        assets?: DetectionState['iconAssetItems']
+        source_size?: [number, number]
+      }
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      const bad = Object.entries(result?.statuses ?? {})
+        .filter(([k]) => k !== 'ok')
+        .map(([k, v]) => `${k}×${v}`)
+        .join(' ')
+      set({
+        iconAssetStatus: 'done',
+        iconAssetSummary: `${result?.ok ?? 0}/${result?.count ?? 0} 组成功${bad ? `（${bad}）` : ''}`,
+        iconAssetItems: result?.assets ?? [],
+        iconAssetSourceSize: result?.source_size ?? null,
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        iconAssetStatus: 'error',
+        iconAssetError: error instanceof Error ? error.message : '素材化失败',
       })
     }
   },
@@ -843,7 +1104,9 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     if (!runInfo || isYoloRunning) return
     set({ isYoloRunning: true, yoloError: '' })
     try {
-      const { task_id } = await submitTask('yolo', runInfo.run_id, {})
+      const { task_id } = await submitTask('yolo', runInfo.run_id, {
+        model: get().yoloModel,
+      })
       const result = (await waitTask(task_id, { intervalMs: 1500 })) as {
         lines?: string[]
         count?: number
@@ -1019,7 +1282,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         image: 'icon_back.png',
         mask_from_holes: 'mid_hole.png',
         output: 'mid_fill.png',
-        prompt: midFillPrompt.trim() || DEFAULT_ICON_BACK_PROMPT,
+        prompt: midFillPrompt.trim() || DEFAULT_MID_FILL_PROMPT,
         seed: midFillSeed,
         steps: midFillSteps,
         guidance: midFillGuidance,

@@ -66,6 +66,12 @@ def ensure_up() -> None:
     )
 
 
+def refine_bboxes(request: dict) -> dict:
+    """bbox 几何回投:每个框作为 box 提示跑 SAM2,用 mask 外接框替换原框。"""
+    ensure_up()
+    return _http("POST", "/refine_bbox", request, timeout=SAM2D_TIMEOUT)
+
+
 def cutout(request: dict) -> dict:
     """提交抠图请求并阻塞到完成。失败抛 RuntimeError(带 daemon 侧 traceback)。"""
     ensure_up()

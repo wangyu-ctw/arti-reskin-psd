@@ -6,6 +6,7 @@ import TextBackPanel from './components/TextBackPanel'
 import IconAnalysisPanel from './components/IconAnalysisPanel'
 import TextFrontPanel from './components/TextFrontPanel'
 import IconExtractPanel from './components/IconExtractPanel'
+import IconAssetPanel from './components/IconAssetPanel'
 import IconBackPanel from './components/IconBackPanel'
 import MidExtractPanel from './components/MidExtractPanel'
 import MidHolePanel from './components/MidHolePanel'
@@ -44,6 +45,9 @@ function App() {
         </div>
         <div className="h-full w-110 shrink-0">
           <IconExtractPanel />
+        </div>
+        <div className="h-full w-110 shrink-0">
+          <IconAssetPanel />
         </div>
         <div className="h-full w-110 shrink-0">
           <IconBackPanel />

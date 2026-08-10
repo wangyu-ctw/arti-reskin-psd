@@ -88,6 +88,7 @@ export default function IconAnalysisPanel() {
     analyzedIcons,
     iconClampInfo,
     runAnalyzeIcons,
+    clearNegativePoints,
   } = useDetectionStore()
 
   // 与第 5 步/分析逻辑同口径:不计 discard 的审计记录
@@ -134,6 +135,14 @@ export default function IconAnalysisPanel() {
               {iconClampInfo ? (
                 <span className="text-[11px] text-black/45">{iconClampInfo}</span>
               ) : null}
+              <Button
+                size="small"
+                danger
+                disabled={!analyzedIcons.some((a) => a.negative_points.length > 0)}
+                onClick={clearNegativePoints}
+              >
+                一键清除负点
+              </Button>
               <Button size="small" onClick={() => setViewerOpen(true)}>
                 查看
               </Button>

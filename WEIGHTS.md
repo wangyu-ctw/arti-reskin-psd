@@ -29,6 +29,23 @@ prompt 与第 8 步推理一致,guidance 4)。产物含 checkpoint-500~3000 可�
 本地组装的 Fill diffusers 目录在 `/workspace/models/FLUX.1-Fill-dev-diffusers/`(训练用底模)。
 注意:pod 上的 HF token 已失效,BFL 系 gated 仓不可下载;需要时让用户重新生成 token。
 
+## Qwen-Image-Edit(icon_repair 任务:icon 语义修复+高清)
+
+2026-08-06 上线。与 FLUX 系共用一个 ComfyUI,按任务自动换载(48G 装不下并存,切换时有加载耗时)。
+
+| 用途 | 真实路径 | 大小 | ComfyUI 内软链位置 | 状态 |
+|---|---|---|---|---|
+| 编辑主模型(2511 fp8mixed) | `/workspace/hf_models/comfy_qwen_image/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors` | ~20G | `models/diffusion_models/qwen_image_edit.safetensors` | 在役 |
+| Qwen2.5-VL 7B 文本编码(fp8) | `.../split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors` | ~9G | `models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors` | 在役 |
+| Qwen Image VAE | `.../split_files/vae/qwen_image_vae.safetensors` | ~250M | `models/vae/qwen_image_vae.safetensors` | 在役 |
+
+来源:Comfy-Org 公开仓(匿名可下,不受 HF token 失效影响)。
+icon_repair 链路:逐 icon 裁块 → Qwen 编辑(修复混乱区+统一放大到 1MP 高清)→ SAM2 抠图 →
+最小透明 PNG 存 `<run>/icon/`,`manifest.csv` 记录回贴坐标,`recompose.png` 为拼回预览。
+icon_asset 链路(第 8+ 步素材化,2026-08-07 上线):第 7 步分组(name/slug)→ 每组选最大成员
+→ 上下文裁块 + icons.png 抠图合成纯色底 → Qwen 双图参照重绘(Plus 节点)→ 自适应边界泛洪去底
+(以输出图边框中位色为准,再清贴边杂物)→ `<run>/icon_assets/<slug>.png` + manifest + 拼回预览。
+
 ## 独立守护进程
 
 | 用途 | 路径 | 大小 | 状态 |
@@ -36,9 +53,13 @@ prompt 与第 8 步推理一致,guidance 4)。产物含 checkpoint-500~3000 可�
 | SAM2(抠图,icon 专项续训 step-1000:贴轮廓环带负点治底座误判,val icon 0.924) | `/workspace/outputs/sam2_icon_20260805/step-1000.pt` | 857M | 在役(2026-08-05 二次上线) |
 | SAM2 全类均衡版(step-7000,val IoU 0.890/基线 0.748) | `/workspace/outputs/sam2_train_20260805/step-7000.pt` | 857M | 回退备份 |
 | SAM2 官方原版 sam2.1_hiera_large | `/workspace/sam2/checkpoints/sam2.1_hiera_large.pt` | 857M | 回退备份(sam2d.sh 删掉 SAM2_CHECKPOINT 行即回退) |
-| YOLO 检测(第 3 步,11m 新数据版 game0804,mAP50 0.752) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt` | 39M | 在役(2026-08-05 三版对比后定版) |
-| YOLO 旧 P2(game0728_p2) | `/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt` | 42M | 回退/对比备份 |
-| YOLO 新数据 P2(game0804_p2,mAP50 0.701 / icon P 0.851) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_p2_best.pt` | 42M | 回退/对比备份 |
+| YOLO game0804_p2(默认,新数据 P2,mAP50 0.701 / icon P 0.851) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_p2_best.pt` | 42M | 在役·默认(2026-08-06 切换) |
+| YOLO game0804_11m(mAP50 0.752) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt` | 39M | 在役·按需加载 |
+| YOLO game0728_p2(旧 P2) | `/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt` | 42M | 在役·按需加载 |
+
+YOLO 为三模型注册表(2026-08-06 起):daemon 同时挂三个权重,检测请求用 `model` 字段选择,
+前端第 3 步有下拉;默认由 yolod.sh 的 `YOLO_DEFAULT_MODEL` 指定(当前 game0804_p2,2026-08-06 起;此前 game0804_11m)。
+另:检测后默认做 SAM2 bbox 几何回投(refine_bbox,治框小一截;text/panel 类不回投)。
 | YOLO 旧版(game0804 的训练起点) | `/workspace/ui_skin/pretrained/yolo/yolo_ui_element_best.pt` | 39M | 回退备份 |
 
 YOLO 训练产物区:`/workspace/outputs/yolo_train/<name>/weights/best.pt`(game0804_from_old 即本次)。

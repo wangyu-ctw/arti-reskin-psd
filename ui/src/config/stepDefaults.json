@@ -27,36 +27,42 @@
     "small": {
       "paddingRatio": 0.01,
       "minPadding": 1,
-      "maskThreshold": 0.55,
+      "maskThreshold": 0.75,
       "featherRadius": 1,
-      "cropScale": 2.5
+      "cropScale": 5,
+      "refine": false,
+      "multimask": true,
+      "fillHoles": true
     },
     "medium": {
       "paddingRatio": 0.02,
       "minPadding": 2,
-      "maskThreshold": 0.45,
+      "maskThreshold": 0.55,
       "featherRadius": 1,
-      "cropScale": 1.5
+      "cropScale": 4.5,
+      "refine": false,
+      "multimask": true,
+      "fillHoles": true
     },
     "large": {
       "paddingRatio": 0.03,
       "minPadding": 4,
-      "maskThreshold": 0.35,
+      "maskThreshold": 0.45,
       "featherRadius": 2,
-      "cropScale": 1.2
-    },
-    "refine": true,
-    "multimask": false,
-    "fillHoles": true
+      "cropScale": 3.5,
+      "refine": true,
+      "multimask": false,
+      "fillHoles": true
+    }
   },
   "assetsExtract": {
     "paddingRatio": 0.03,
     "minPadding": 3,
     "maskThreshold": 0.7,
     "featherRadius": 2,
-    "cropScale": 1,
-    "refine": true,
-    "multimask": false,
+    "cropScale": 3,
+    "refine": false,
+    "multimask": true,
     "fillHoles": true
   },
   "barExtract": {
@@ -64,7 +70,7 @@
     "minPadding": 5,
     "maskThreshold": 0.7,
     "featherRadius": 2,
-    "cropScale": 1,
+    "cropScale": 3,
     "refine": false,
     "multimask": false,
     "fillHoles": false
@@ -74,7 +80,7 @@
     "minPadding": 2,
     "maskThreshold": 0.55,
     "featherRadius": 2,
-    "cropScale": 1,
+    "cropScale": 1.5,
     "refine": false,
     "multimask": false,
     "fillHoles": true
@@ -84,9 +90,31 @@
     "seed": 33,
     "steps": 20,
     "guidance": 4,
+    "growMask": 2,
+    "maskBlur": 4,
+    "maxPixels": 1048576,
+    "fillHoles": true
+  },
+  "midFill": {
+    "prompt": "Inpaint the masked holes. The holes are cutout silhouettes left by removed UI elements (character portraits, item slots, buttons, progress bars) — the SHAPE of a hole carries zero information about what should be painted inside it. Never draw anything that follows, echoes, outlines or is centered on the hole shape.\nAbsolute prohibitions: NEVER paint characters, people, creatures, mascots, faces, bodies, silhouettes or any figure inside a hole — the removed content must not be recreated in any form. No icons, no symbols, no logos, no badges, no text, no letters, no numbers, no new ornaments or motifs.\nColor and vibrancy fidelity: reconstruct each hole with EXACTLY the same hue, saturation and brightness as the immediately surrounding intact surface. Never wash out, desaturate, dim, fog or gray down the filled area — vivid colors stay fully vivid. Everything outside the masked holes must keep its exact original colors and saturation: no global tint, no fading, no contrast or vibrance shift anywhere.\nSeamlessness: the repair must be invisible. Continue the surrounding surface — its flat color, gradient, texture grain, panel border lines — precisely across the hole, matching sharpness and lighting, so that no boundary, halo, smudge, blur ring or sharpness difference reveals where the hole was.\nReconstruction priority — color first, pattern second: sample the colors that directly touch each hole's edge and extend them inward with smooth, seamless blending. Only continue a line, border or stripe if it visibly touches the hole boundary and obviously needs to reconnect on the other side — keep its direction, thickness and spacing, nothing more. Never import patterns or motifs from other parts of the image. When in doubt, fill with the plain color or gradient of the immediately surrounding surface and nothing else.",
+    "seed": 3,
+    "steps": 20,
+    "guidance": 4,
     "growMask": 1,
     "maskBlur": 4,
     "maxPixels": 1048576,
     "fillHoles": true
+  },
+  "iconGroups": {
+    "model": "google/gemini-3.1-pro-preview",
+    "models": [
+      "google/gemini-3.1-pro-preview",
+      "qwen/qwen3-vl-235b-a22b-instruct",
+      "google/gemini-3.6-flash",
+      "google/gemini-2.5-pro"
+    ],
+    "temperature": 0,
+    "systemPrompt": "你是一名游戏 UI 图标分析专家。用户会提供一张已去除文字的游戏 UI 图片,以及一组 icon 检测框(归一化 YOLO 格式 [center_x, center_y, width, height],数值 0～1,附下标 index)。检测框本身视为正确,不需要核对、修正或增删。\n任务一:识别。逐框看图,弄清每个图标是什么、干什么用。识别时的整体观:如果图标下面有一块专门承载它的底板/底座(为这个图标量身设计——图形占底板一半以上、底板离开这个图标就没有独立含义,如圆形徽章底、技能框、菱形底座、光效衬底),把图标和底座当作一个整体来理解与命名;通用的面板、卡片、列表格子承载多个元素或大面积留白,不属于专属底座,不并入。\n任务二:归组。把相同的图标归为一组:\n- 判同的标准是\"同一张素材图的复用\",而不是\"同一个语义符号\"——两个图标必须像素级长得一样(仅允许整体缩放和轻微光效差异)才算相同。\n- 专属底座是图标身份的一部分:底座形状不同(菱形/圆形/六边形)、底座或图形配色不同,即使中间的符号相同,也必须分成不同的组。反例:绿色菱形底座的感叹号 与 红色圆形底座的感叹号,符号同为\"!\",但它们是两张不同的素材,必须分为两组。\n- 相同 = 图形内容一致、底座一致、配色一致且朝向一致(只允许大小差异和轻微光效差异)。颜色、形状、朝向或镜像不同的(左箭头与右箭头、上三角与下三角)必须分开成组——每组之后会共用同一张素材图,贴反了是事故。典型场景:同一种资源/货币图标(金币、钻石、体力)在界面多处出现;列表或网格因复用产生的重复图标(每行一个的前往箭头、加号、锁等)。\n- 不相同 = 仅形状类似但内容不同(红药水与蓝药水、不同武器),或同类但等级/颜色变体不同——必须分开成组。\n- 拿不准时宁可分开,严禁错并。独一无二的图标自成一组。\n输出:只返回符合 Schema 的 JSON:{\"groups\":[{\"name\":\"...\",\"slug\":\"...\",\"indices\":[...]}]}。\n- name:说明这个图标是什么或干什么用(如\"金币货币图标\"\"设置齿轮按钮\"\"带圆形底座的剑形攻击技能图标\")。只说它是什么,不要描述它的位置、所在区域或序号。\n- slug:给这组图标取一个独一无二的英文名,小写字母/数字/下划线,简短达意(如 gold_coin、settings_gear、attack_skill_sword),将用作素材文件名,全部组之间严禁重名。\n- indices:该组所有成员的下标。每个输入下标必须恰好出现在一个组里,不遗漏、不重复。",
+    "userPrompt": "请识别并归组这张图片中的以下 icon 检测框："
   }
 }

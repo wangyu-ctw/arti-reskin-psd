@@ -50,8 +50,8 @@ function TierSection({
             <InputNumber
               className="w-full"
               size="small"
-              value={params[f.key]}
-              onChange={(v) => setIconTierParam(tier, f.key, v ?? 0)}
+              value={params[f.key] as number}
+              onChange={(v) => setIconTierParam(tier, f.key, (v ?? 0) as never)}
               disabled={disabled}
               step={f.step}
               min={f.min}
@@ -60,15 +60,35 @@ function TierSection({
           </div>
         ))}
       </div>
+      <div className="mt-1.5 flex gap-4">
+        <Checkbox
+          checked={params.refine}
+          disabled={disabled}
+          onChange={(e) => setIconTierParam(tier, 'refine', e.target.checked)}
+        >
+          <span className="text-[11px]">二轮精化</span>
+        </Checkbox>
+        <Checkbox
+          checked={params.multimask}
+          disabled={disabled}
+          onChange={(e) => setIconTierParam(tier, 'multimask', e.target.checked)}
+        >
+          <span className="text-[11px]">多候选取最优</span>
+        </Checkbox>
+        <Checkbox
+          checked={params.fillHoles}
+          disabled={disabled}
+          onChange={(e) => setIconTierParam(tier, 'fillHoles', e.target.checked)}
+        >
+          <span className="text-[11px]">mask 自动封孔</span>
+        </Checkbox>
+      </div>
     </div>
   )
 }
 
 function SettingsPopover() {
   const iconSource = useDetectionStore((s) => s.iconSource)
-  const iconRefine = useDetectionStore((s) => s.iconRefine)
-  const iconMultimask = useDetectionStore((s) => s.iconMultimask)
-  const iconFillHoles = useDetectionStore((s) => s.iconFillHoles)
   const iconSmallMaxSide = useDetectionStore((s) => s.iconSmallMaxSide)
   const iconLargeMinSide = useDetectionStore((s) => s.iconLargeMinSide)
   const iconStatus = useDetectionStore((s) => s.iconStatus)
@@ -99,33 +119,6 @@ function SettingsPopover() {
               ]}
             />
           </div>
-          <Checkbox
-            checked={iconRefine}
-            disabled={running}
-            onChange={(e) => setField('iconRefine', e.target.checked)}
-          >
-            <span className="text-[12px]">
-              二轮精化（mask_input 再收敛一轮；有填洞倾向，保留区偏多时先关它）
-            </span>
-          </Checkbox>
-          <Checkbox
-            checked={iconMultimask}
-            disabled={running}
-            onChange={(e) => setField('iconMultimask', e.target.checked)}
-          >
-            <span className="text-[12px]">
-              多候选取最优（icon 连衬底整块被抠时开它，常能选中更细粒度）
-            </span>
-          </Checkbox>
-          <Checkbox
-            checked={iconFillHoles}
-            disabled={running}
-            onChange={(e) => setField('iconFillHoles', e.target.checked)}
-          >
-            <span className="text-[12px]">
-              mask 自动封孔（每个 icon 的 mask 实心无镂空；想保留镂空处透明就关掉）
-            </span>
-          </Checkbox>
           <div className="flex items-center gap-2 text-[12px]">
             <span>分档阈值（icon 像素长边）：≤</span>
             <InputNumber
@@ -155,6 +148,10 @@ function SettingsPopover() {
           <div className="text-[11px] leading-snug text-black/40">
             padRatio=外扩比例 · minPad=最小外扩px · maskThr=掩码阈值（越高越保守）·
             feather=边缘羽化 · cropScale=切片倍数（≤1 整图）
+            <br />
+            二轮精化=mask_input 再收敛一轮，有填洞倾向，保留区偏多时先关它 ·
+            多候选取最优=icon 连衬底整块被抠时开它，常能选中更细粒度 ·
+            mask 自动封孔=每个 icon 的 mask 实心无镂空，想保留镂空处透明就关掉
           </div>
         </div>
       }
@@ -174,15 +171,19 @@ export default function IconExtractPanel() {
     textBackStatus,
     iconStatus,
     iconSource,
-    analyzedIcons,
     iconImageUrl,
     iconError,
+    iconRefineQaStatus,
+    iconRefineQaError,
+    iconRefineQaInfo,
     runExtractIcons,
+    runRefineIcons,
   } = useDetectionStore()
 
+  const analyzedIcons = useDetectionStore((s) => s.analyzedIcons)
   const useAnalyzed = Boolean(analyzedIcons?.length)
   const iconCount = useAnalyzed
-    ? (analyzedIcons?.filter((a) => !a.should_delete).length ?? 0)
+    ? (analyzedIcons?.length ?? 0)
     : pickDetections(structuredResult, 'icon').length
   // 纯原图只需已上传;涉及去字图的模式(去字图/双源择优)需第 2 步已出结果
   const sourceReady =
@@ -204,13 +205,22 @@ export default function IconExtractPanel() {
           </span>
           <div className="flex items-center gap-2">
             {iconStatus === 'done' ? (
-              <Button
-                size="small"
-                disabled={!canExtract}
-                onClick={() => void runExtractIcons()}
-              >
-                重新提取
-              </Button>
+              <>
+                <Button
+                  size="small"
+                  loading={iconRefineQaStatus === 'running'}
+                  onClick={() => void runRefineIcons()}
+                >
+                  修正
+                </Button>
+                <Button
+                  size="small"
+                  disabled={!canExtract}
+                  onClick={() => void runExtractIcons()}
+                >
+                  重新提取
+                </Button>
+              </>
             ) : null}
             <SettingsPopover />
           </div>
@@ -227,12 +237,27 @@ export default function IconExtractPanel() {
           </span>
         </div>
       ) : iconStatus === 'done' ? (
-        <div style={CHECKERBOARD}>
-          <img
-            src={iconImageUrl}
-            alt="icon 提取结果"
-            className="h-auto max-w-full object-contain"
-          />
+        <div className="flex flex-col gap-2">
+          {iconRefineQaStatus === 'running' ? (
+            <div className="text-[12px] text-black/45">
+              正在质检…（gemini 3.1 pro 检查粘连/保守问题,发现问题会自动重抠）
+            </div>
+          ) : iconRefineQaStatus === 'error' ? (
+            <div className="break-all text-[12px] text-[#cf1322]">
+              修正失败：{iconRefineQaError}
+            </div>
+          ) : iconRefineQaInfo ? (
+            <div className="break-all text-[12px] text-black/60">
+              {iconRefineQaInfo}
+            </div>
+          ) : null}
+          <div style={CHECKERBOARD}>
+            <img
+              src={iconImageUrl}
+              alt="icon 提取结果"
+              className="h-auto max-w-full object-contain"
+            />
+          </div>
         </div>
       ) : (
         <div className="flex h-full flex-col items-center justify-center gap-3">
@@ -259,7 +284,7 @@ export default function IconExtractPanel() {
           ) : (
             <span className="text-[12px] text-black/45">
               将以「{sourceLabel}」提取 {iconCount} 个 icon
-              {useAnalyzed ? '（使用第 7 步分析后的框和正负点）' : '（未分析，使用原始检测框）'}
+              {useAnalyzed ? '（小图标带第 7 步正点，其余仅检测框）' : '（未分析，使用原始检测框）'}
             </span>
           )}
         </div>

@@ -5,6 +5,7 @@ payload 里约定带 run_id,handler 用 storage.get_run_dir(run_id) 拿到目录
 
 后续在这里实现 omnipsd / yolo / sam2 的真实逻辑,模型权重建议模块级加载一次、常驻显存。
 """
+import csv
 import math
 import os
 import shutil
@@ -153,6 +154,98 @@ def _build_text_protect_mask(run_dir: Path, size: tuple, grow: int,
     return mask, used
 
 
+DEFAULT_RESIDUAL_FILL_PROMPT = (
+    "Fill the masked regions with clean UI background, seamlessly matching "
+    "the surrounding colors, textures and patterns. No text, no letters, "
+    "no numbers, no symbols."
+)
+
+
+def _remove_residual_text(run_dir: Path, image_path: Path, size: tuple,
+                          conf_min: float, grow: int, seed: int, steps: int,
+                          lora_name, guidance: float) -> dict:
+    """残字复检与清除:对合成完的去字图再跑一次 YOLO(结果不落盘),
+    若仍检出 text,用 SAM2 抠出文字 mask,flux_fill 补洞后同尺寸 mask 内回贴。
+
+    整个过程只改 mask 内像素:回贴与输入同尺寸,零重采样,不糊不色偏。
+    """
+    det = yoloc.detect({
+        "dir": str(run_dir), "image": image_path.name,
+        "imgsz": 1600, "conf": 0.05, "iou": 0.7,
+        "augment": False, "slice": False, "slice_size": 640,
+    })
+    boxes = []
+    for line in det.get("lines", []):
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "0":
+            continue
+        conf = float(parts[5]) if len(parts) > 5 else 1.0
+        if conf >= conf_min:
+            boxes.append([float(v) for v in parts[1:5]])
+    if not boxes:
+        return {"found": 0, "filled": False}
+
+    tw, th = size
+    # SAM2 抠残字的精确 mask;失败或抠空时退化为整框矩形
+    mask = None
+    tmp_name = "_residual_text.png"
+    try:
+        sam2c.cutout({
+            "dir": str(run_dir), "image": image_path.name, "output": tmp_name,
+            "borders": [{"bbox": b, "positive_points": [],
+                         "negative_points": []} for b in boxes],
+            "padding_ratio": 0.05, "min_padding": 2,
+            "mask_threshold": 0.5, "feather_radius": 0,
+            "multimask": False, "crop_scale": 1.5, "refine": True,
+            "fill_holes": True, "size_rules": [],
+        })
+        tmp_path = run_dir / tmp_name
+        if tmp_path.is_file():
+            with Image.open(tmp_path) as c:
+                alpha = c.convert("RGBA").getchannel("A")
+            m = alpha.point(lambda a: 255 if a > 0 else 0)
+            if m.getbbox():
+                mask = m
+            tmp_path.unlink(missing_ok=True)
+    except RuntimeError:
+        pass
+    if mask is None:
+        mask = Image.new("L", size, 0)
+        draw = ImageDraw.Draw(mask)
+        for cx, cy, w, h in boxes:
+            draw.rectangle([(cx - w / 2) * tw - 2, (cy - h / 2) * th - 2,
+                            (cx + w / 2) * tw + 2, (cy + h / 2) * th + 2],
+                           fill=255)
+    if mask.size != size:
+        mask = mask.resize(size, Image.Resampling.NEAREST)
+    if grow > 0:
+        mask = mask.filter(ImageFilter.MaxFilter(size=2 * grow + 1))
+    soft = mask.filter(ImageFilter.GaussianBlur(2))
+    mask_rgb = soft.convert("RGB")  # ImageToMask 读红通道
+
+    image_name = comfy.place_input_image(image_path, prefix="residual_")
+    mask_name = comfy.place_input_pil(mask_rgb, prefix="residual_mask_")
+    entry = comfy.run_workflow(build_flux_fill_workflow(
+        image_name=image_name, mask_name=mask_name,
+        prompt=DEFAULT_RESIDUAL_FILL_PROMPT, seed=seed, steps=steps,
+        width=tw, height=th, guidance=guidance, lora_name=lora_name))
+    images = comfy.output_image_paths(entry)
+    if not images:
+        return {"found": len(boxes), "filled": False,
+                "error": "fill produced no output"}
+    with Image.open(images[0]) as g:
+        gen = g.convert("RGB")
+        if gen.size != size:
+            gen = gen.resize(size, Image.Resampling.LANCZOS)
+    with Image.open(image_path) as b:
+        base = b.convert("RGB")
+    # 补洞区先向底图对齐色彩,再仅在 mask 内回贴(同尺寸,零重采样)
+    gen, _ = _match_colors_to_input(gen, base, mask_rgb)
+    Image.composite(gen, base, soft).save(image_path)
+    return {"found": len(boxes), "filled": True,
+            "prompt_id": entry.get("prompt_id")}
+
+
 def handle_text_back(payload: dict) -> dict:
     """去字模型(常驻 ComfyUI 版):读 <run_dir>/origin.png,输出 <run_dir>/text_back.png。
 
@@ -163,6 +256,10 @@ def handle_text_back(payload: dict) -> dict:
              protect_grow(默认 8)文字框外扩 px、protect_feather(默认 4)边缘羽化、
              protect_conf(默认 0.2)text 框置信度门槛(太低的框不给重生成权,
              防止误检的"假文字"框让 icon 失去保护)。
+             residual_check(默认 True):合成后残字复检——再跑一次 YOLO(不落盘),
+             若仍有 text(conf>=residual_conf,默认 0.3),SAM2 抠出文字 mask
+             外扩 residual_grow(默认 4)px,flux_fill 补洞(默认挂 icon_back LoRA,
+             residual_lora 传空串禁用),补完仅 mask 内回贴,得到最终 text_back。
     """
     run_dir = _resolve_run_dir(payload)
     origin = run_dir / "origin.png"
@@ -205,15 +302,34 @@ def handle_text_back(payload: dict) -> dict:
                 gen = gen.resize((tw, th), Image.Resampling.LANCZOS)
         with Image.open(origin) as o:
             base = o.convert("RGB").resize((tw, th), Image.Resampling.LANCZOS)
+    # 中间态写暂存名,残字处理完再原子替换:text_back.png 这个名字
+    # 从头到尾只出现最终图,杜绝前端在补洞窗口期缓存到中间态
+    stage_path = run_dir / "_text_back_stage.png"
+    if protect:
         # mask 白区取重生成像素,黑区保留原图像素
-        Image.composite(gen, base, mask).save(output_path)
+        Image.composite(gen, base, mask).save(stage_path)
     else:
-        shutil.copyfile(images[0], output_path)
+        shutil.copyfile(images[0], stage_path)
+
+    # 残字复检:合成完再 YOLO 一遍(不落盘),还有 text 就 SAM2 抠掉 + Fill 补洞
+    residual = None
+    if bool(payload.get("residual_check", True)):
+        residual = _remove_residual_text(
+            run_dir, stage_path, (tw, th),
+            conf_min=float(payload.get("residual_conf", 0.3)),
+            grow=int(payload.get("residual_grow", 4)),
+            seed=seed,
+            steps=int(payload.get("residual_steps", 20)),
+            lora_name=payload.get("residual_lora", ICON_BACK_LORA_NAME) or None,
+            guidance=float(payload.get("residual_guidance", 30.0)),
+        )
+    os.replace(stage_path, output_path)
     return {
         "output_path": str(output_path),
         "size": [tw, th],
         "protect": protect,
         "protected_text_boxes": protected_boxes,
+        "residual_text": residual,
         "prompt_id": entry.get("prompt_id"),
         "elapsed_sec": round(time.time() - started, 1),
     }
@@ -407,6 +523,34 @@ def _build_fill_mask(run_dir: Path, payload: dict, size: tuple) -> Image.Image:
     return mask.convert("RGB")  # ImageToMask 读红通道
 
 
+def _match_colors_to_input(gen: Image.Image, ref: Image.Image,
+                           mask_rgb: Image.Image):
+    """外域色彩匹配:对冲 VAE 往返的系统性色偏(表现为洞外整体变淡/去饱和)。
+
+    以洞外区域为样本,统计生成图 vs 输入图的逐通道均值/方差偏移,求逆仿射
+    应用到整张生成图——洞外拉回原色,洞内跟随同一变换与周围保持一致。
+    纯逐像素查表,零重采样,不会引入任何模糊。
+    返回 (校正后图像, 逐通道均值偏移) ;洞外占比过小时不校正。
+    """
+    from PIL import ImageStat
+    outside = mask_rgb.getchannel("R").point(lambda v: 255 if v < 16 else 0)
+    if ImageStat.Stat(outside).mean[0] < 2:  # 洞外不足 ~1%,统计不可靠
+        return gen, None
+    ref_stat = ImageStat.Stat(ref, outside)
+    gen_stat = ImageStat.Stat(gen, outside)
+    bands = []
+    shifts = []
+    for i, band in enumerate(gen.split()):
+        mg, mr = gen_stat.mean[i], ref_stat.mean[i]
+        sg, sr = gen_stat.stddev[i], ref_stat.stddev[i]
+        # 方差比夹在温和区间,防止病态放大
+        scale = max(0.8, min(1.3, (sr / sg) if sg > 1e-3 else 1.0))
+        lut = [min(255, max(0, round((v - mg) * scale + mr))) for v in range(256)]
+        bands.append(band.point(lut))
+        shifts.append(round(mr - mg, 2))
+    return Image.merge("RGB", bands), shifts
+
+
 def handle_flux_fill(payload: dict) -> dict:
     """精准修补(FLUX.1-Fill-dev):只重绘 mask 区域,其余像素保持原样。
 
@@ -427,6 +571,8 @@ def handle_flux_fill(payload: dict) -> dict:
         max_pixels       默认 1048576
         hole_output      可选,传文件名(如 icon_hole.png)则顺手输出"破洞图":
                          输入图 + 修补区变透明(用原始 alpha 硬抠,不含 grow/blur)
+        color_match      默认 True:外域色彩匹配——按洞外区域统计并对冲 VAE 往返
+                         的整体色偏/去饱和;纯查表零重采样,不会引入模糊
     """
     if payload.get("dir"):
         run_dir = Path(payload["dir"])
@@ -472,10 +618,22 @@ def handle_flux_fill(payload: dict) -> dict:
                            f"(prompt_id={entry.get('prompt_id')})")
 
     output_path = run_dir / (payload.get("output") or "inpainted.png")
-    shutil.copyfile(images[0], output_path)
+    color_shift = None
+    if bool(payload.get("color_match", True)):
+        with Image.open(images[0]) as g:
+            gen = g.convert("RGB")
+        with Image.open(origin) as o:
+            ref = o.convert("RGB").resize(gen.size, Image.Resampling.LANCZOS)
+        mask_for_stat = (mask_img if mask_img.size == gen.size
+                         else mask_img.resize(gen.size, Image.Resampling.NEAREST))
+        corrected, color_shift = _match_colors_to_input(gen, ref, mask_for_stat)
+        corrected.save(output_path)
+    else:
+        shutil.copyfile(images[0], output_path)
     result = {
         "output_path": str(output_path),
         "size": [tw, th],
+        "color_shift": color_shift,
         "mask_path": str(mask_debug_path),
         "prompt_id": entry.get("prompt_id"),
         "elapsed_sec": round(time.time() - started, 1),
@@ -587,6 +745,11 @@ def handle_yolo(payload: dict) -> dict:
         run_id / dir     图片所在目录(二选一)
         image            输入图片名,默认 origin.png
         imgsz / conf / iou   默认 1333 / 0.1 / 0.7
+        model            可选,按 key 选权重:game0804_11m(默认)/ game0804_p2 / game0728_p2
+        refine_bbox      默认 True:SAM2 几何回投——每个框跑一次分割,用 mask 的
+                         紧致外接框替换 YOLO 框,治"检测框小了一截"的系统性偏差
+        refine_classes   默认 [1,2,3,4](icon/assets/button/bar);text 不回投
+                         (字形稀疏 mask 会把行框改小),panel 不回投(大框风险高)
     结果同时写 <run_dir>/yolo.txt 留档。
     """
     if payload.get("dir"):
@@ -601,6 +764,7 @@ def handle_yolo(payload: dict) -> dict:
     result = yoloc.detect({
         "dir": str(run_dir),
         "image": image,
+        "model": payload.get("model"),
         "imgsz": payload.get("imgsz", 1600),
         "conf": payload.get("conf", 0.05),
         "iou": payload.get("iou", 0.7),
@@ -608,8 +772,30 @@ def handle_yolo(payload: dict) -> dict:
         "slice": payload.get("slice", False),
         "slice_size": payload.get("slice_size", 640),
     })
+
+    lines = result.get("lines", [])
+    if payload.get("refine_bbox", True) and lines:
+        refine_classes = set(payload.get("refine_classes", [1, 2, 3, 4]))
+        parsed = [line.split() for line in lines]
+        idxs = [i for i, p in enumerate(parsed)
+                if len(p) >= 5 and int(p[0]) in refine_classes]
+        if idxs:
+            refined = sam2c.refine_bboxes({
+                "dir": str(run_dir), "image": image,
+                "borders": [{"bbox": [float(v) for v in parsed[i][1:5]]}
+                            for i in idxs],
+            })
+            n_refined = 0
+            for i, rb in zip(idxs, refined.get("bboxes", [])):
+                if rb.get("refined"):
+                    parsed[i][1:5] = [f"{v:.6f}" for v in rb["bbox"]]
+                    n_refined += 1
+            lines = [" ".join(p) for p in parsed]
+            result["lines"] = lines
+            result["bbox_refined"] = n_refined
+
     txt_path = run_dir / "yolo.txt"
-    txt_path.write_text("\n".join(result.get("lines", [])) + "\n", encoding="utf-8")
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     result["txt_path"] = str(txt_path)
     result["elapsed_sec"] = round(time.time() - started, 1)
     return result
@@ -671,6 +857,657 @@ def handle_sam2(payload: dict) -> dict:
     return result
 
 
+DEFAULT_ICON_REPAIR_PROMPT = (
+    "修复这个游戏图标:图中可能存在残缺、涂抹混乱、无逻辑的破损区域,"
+    "把它们恢复为完整、合理、符合图标语义的图形。"
+    "严格保持图标原有的风格、配色、构图、轮廓和朝向不变,背景保持原样,"
+    "不要添加任何文字。输出高清、边缘锐利的版本。"
+)
+
+# 备选提示词(payload.prompt 传入):在默认版基础上追加去马赛克指令,
+# 对极小 icon(放大后块状化)效果显著,但对中等 icon 有诱发重绘幻觉的风险,
+# 建议只对块状化的个别 icon 重跑时使用(2026-08-07 A/B 实测)。
+ICON_REPAIR_DEPIXEL_CLAUSE = (
+    "如果图像因放大而出现马赛克、像素块、锯齿或模糊,"
+    "将其重绘为线条平滑、色块干净、细节清晰的高清版本。"
+)
+
+
+def build_qwen_edit_workflow(image_name: str, prompt: str, seed: int, steps: int,
+                             cfg: float = 2.5, denoise: float = 1.0,
+                             megapixels: float = 1.0) -> dict:
+    """Qwen-Image-Edit 2511 指令编辑 workflow(ComfyUI API 格式)。
+
+    输入图统一缩放到 megapixels 总像素再编辑:小 icon 裁块相当于先放大后重生成,
+    修复顺手完成高清化。
+    """
+    return {
+        "unet": {"class_type": "UNETLoader",
+                 "inputs": {"unet_name": "qwen_image_edit.safetensors",
+                            "weight_dtype": "default"}},
+        "shift": {"class_type": "ModelSamplingAuraFlow",
+                  "inputs": {"model": ["unet", 0], "shift": 3.1}},
+        "cfgnorm": {"class_type": "CFGNorm",
+                    "inputs": {"model": ["shift", 0], "strength": 1.0}},
+        "clip": {"class_type": "CLIPLoader",
+                 "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                            "type": "qwen_image"}},
+        "vae": {"class_type": "VAELoader",
+                "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+        "load": {"class_type": "LoadImage", "inputs": {"image": image_name}},
+        "scale": {"class_type": "ImageScaleToTotalPixels",
+                  "inputs": {"image": ["load", 0], "upscale_method": "lanczos",
+                             "megapixels": megapixels, "resolution_steps": 16}},
+        "pos": {"class_type": "TextEncodeQwenImageEdit",
+                "inputs": {"clip": ["clip", 0], "vae": ["vae", 0],
+                           "image": ["scale", 0], "prompt": prompt}},
+        "neg": {"class_type": "TextEncodeQwenImageEdit",
+                "inputs": {"clip": ["clip", 0], "vae": ["vae", 0],
+                           "image": ["scale", 0], "prompt": ""}},
+        "encode": {"class_type": "VAEEncode",
+                   "inputs": {"pixels": ["scale", 0], "vae": ["vae", 0]}},
+        "sample": {"class_type": "KSampler",
+                   "inputs": {"model": ["cfgnorm", 0], "positive": ["pos", 0],
+                              "negative": ["neg", 0], "latent_image": ["encode", 0],
+                              "seed": seed, "steps": steps, "cfg": cfg,
+                              "sampler_name": "euler", "scheduler": "simple",
+                              "denoise": denoise}},
+        "decode": {"class_type": "VAEDecode",
+                   "inputs": {"samples": ["sample", 0], "vae": ["vae", 0]}},
+        "save": {"class_type": "SaveImage",
+                 "inputs": {"images": ["decode", 0],
+                            "filename_prefix": "icon_repair"}},
+    }
+
+
+def handle_icon_repair(payload: dict) -> dict:
+    """icon 批量修复:逐 icon 裁块 → Qwen-Image-Edit 修复+高清 → SAM2 抠图
+    → 最小透明 PNG 存 <run_dir>/icon/,manifest.csv 记录精确回贴位置。
+
+    payload:
+        run_id / dir   二选一
+        image          裁块源图,默认 text_back.png
+        icons          可选 [{"bbox":[cx,cy,w,h] 归一化, "conf":可选}, ...];
+                       不传则读 yolo.txt 里 class=1(icon)且 conf>=conf_min 的行
+        conf_min       默认 0.25(仅 yolo.txt 来源生效)
+        pad_ratio      默认 0.25,裁块上下文外扩(相对 icon 长边);min_pad 默认 16px
+        prompt / seed / steps / cfg / denoise / megapixels   Qwen 编辑参数
+        color_match    默认 True,编辑结果向原裁块整体色彩匹配(对冲 VAE 色偏)
+        max_icons      可选,只处理前 N 个(调试用)
+        keep_debug     默认 True,修复后的完整裁块留在 icon/_debug/ 供检查
+
+    输出:
+        icon/icon_NN.png    最小透明 PNG(高清尺寸,通常大于原 icon)
+        icon/manifest.csv   回贴表:把 png 缩放到 paste_w×paste_h、
+                            贴到源图 (paste_x,paste_y) 即精确拼回
+        icon/recompose.png  按 manifest 拼回的整层透明预览
+    """
+    if payload.get("dir"):
+        run_dir = Path(payload["dir"])
+    else:
+        run_dir = storage.get_run_dir(payload["run_id"])
+    src_name = payload.get("image") or "text_back.png"
+    src_path = run_dir / src_name
+    if not src_path.is_file():
+        raise FileNotFoundError(f"input image not found: {src_path}")
+    with Image.open(src_path) as im:
+        src = im.convert("RGB")
+    sw, sh = src.size
+
+    icons = payload.get("icons")
+    if not icons:
+        txt = run_dir / "yolo.txt"
+        if not txt.is_file():
+            raise ValueError("payload.icons missing and yolo.txt not found")
+        conf_min = float(payload.get("conf_min", 0.25))
+        icons = []
+        for line in txt.read_text(encoding="utf-8").splitlines():
+            p = line.split()
+            if len(p) >= 5 and p[0] == "1":
+                conf = float(p[5]) if len(p) > 5 else 1.0
+                if conf >= conf_min:
+                    icons.append({"bbox": [float(v) for v in p[1:5]],
+                                  "conf": conf})
+    if not icons:
+        raise ValueError("no icons to repair")
+    if payload.get("max_icons"):
+        icons = icons[: int(payload["max_icons"])]
+
+    pad_ratio = float(payload.get("pad_ratio", 0.25))
+    min_pad = int(payload.get("min_pad", 16))
+    prompt = payload.get("prompt") or DEFAULT_ICON_REPAIR_PROMPT
+    seed = int(payload.get("seed", 5))
+    steps = int(payload.get("steps", 20))
+    cfg = float(payload.get("cfg", 2.5))
+    denoise = float(payload.get("denoise", 1.0))
+    megapixels = float(payload.get("megapixels", 1.0))
+    color_match = bool(payload.get("color_match", True))
+    keep_debug = bool(payload.get("keep_debug", True))
+
+    out_dir = run_dir / "icon"
+    out_dir.mkdir(exist_ok=True)
+    if keep_debug:
+        (out_dir / "_debug").mkdir(exist_ok=True)
+
+    def _one(i: int, ic: dict) -> dict:
+        cx, cy, w, h = ic["bbox"]
+        row = {"index": i, "file": "", "status": "ok",
+               "cx": cx, "cy": cy, "w": w, "h": h,
+               "conf": round(float(ic.get("conf", 1.0)), 4),
+               "paste_x": 0, "paste_y": 0, "paste_w": 0, "paste_h": 0,
+               "png_w": 0, "png_h": 0}
+        bx0, by0 = (cx - w / 2) * sw, (cy - h / 2) * sh
+        bx1, by1 = (cx + w / 2) * sw, (cy + h / 2) * sh
+        pad = max(min_pad, round(max(bx1 - bx0, by1 - by0) * pad_ratio))
+        x0, y0 = max(0, int(bx0 - pad)), max(0, int(by0 - pad))
+        x1, y1 = min(sw, int(math.ceil(bx1 + pad))), min(sh, int(math.ceil(by1 + pad)))
+        cw, ch = x1 - x0, y1 - y0
+        if cw < 8 or ch < 8:
+            row["status"] = "too_small"
+            return row
+
+        crop = src.crop((x0, y0, x1, y1))
+        # 注意:megapixels 不要低于 ~1.0,Qwen-Image-Edit 按 1MP 训练,
+        # 低分辨率采样会直接出糊块与幻觉(2026-08-07 实测)
+        input_name = comfy.place_input_pil(crop, prefix=f"icon_repair_{i:02d}_")
+        entry = comfy.run_workflow(build_qwen_edit_workflow(
+            input_name, prompt, seed, steps, cfg, denoise, megapixels))
+        images = comfy.output_image_paths(entry)
+        if not images:
+            row["status"] = "comfy_no_output"
+            return row
+        with Image.open(images[0]) as g:
+            gen = g.convert("RGB")
+        if color_match:
+            ref = crop.resize(gen.size, Image.Resampling.LANCZOS)
+            # 全黑 mask = 整图都算"洞外",按整块裁块统计色偏
+            gen, _ = _match_colors_to_input(
+                gen, ref, Image.new("RGB", gen.size, (0, 0, 0)))
+        ow, oh = gen.size
+
+        # SAM2 在修复后的高清裁块上抠图(归一化坐标不受缩放影响)
+        work_name = f"icon/_work_{i:02d}.png"
+        cut_name = f"icon/_cut_{i:02d}.png"
+        gen.save(run_dir / work_name)
+        nb = [((bx0 + bx1) / 2 - x0) / cw, ((by0 + by1) / 2 - y0) / ch,
+              (bx1 - bx0) / cw, (by1 - by0) / ch]
+        # 裁块四角必在 icon 框外(pad>0 保证),自动做负点,压制背景粘连
+        neg_pts = [[0.02, 0.02], [0.98, 0.02], [0.02, 0.98], [0.98, 0.98]]
+        tight = None
+        cut = None
+        try:
+            sam2c.cutout({
+                "dir": str(run_dir), "image": work_name, "output": cut_name,
+                "borders": [{"bbox": nb, "positive_points": [],
+                             "negative_points": neg_pts}],
+                "padding_ratio": 0.02, "min_padding": 1,
+                "mask_threshold": 0.5, "feather_radius": 0,
+                "multimask": False, "crop_scale": 1.5, "refine": True,
+                "fill_holes": True, "size_rules": [],
+            })
+            cut_path = run_dir / cut_name
+            if cut_path.is_file():
+                with Image.open(cut_path) as c:
+                    cut = c.convert("RGBA")
+                tight = cut.getchannel("A").getbbox()
+        except RuntimeError:
+            row["status"] = "sam2_error"
+
+        if tight and cut is not None:
+            icon_img = cut.crop(tight)
+        else:
+            # 兜底:抠图失败时用 bbox 区域不透明输出,保证拼回不缺件
+            if row["status"] == "ok":
+                row["status"] = "sam2_empty"
+            fx, fy = ow / cw, oh / ch
+            tight = (int((bx0 - x0) * fx), int((by0 - y0) * fy),
+                     min(ow, int(math.ceil((bx1 - x0) * fx))),
+                     min(oh, int(math.ceil((by1 - y0) * fy))))
+            icon_img = gen.crop(tight).convert("RGBA")
+
+        fname = f"icon_{i:02d}.png"
+        icon_img.save(out_dir / fname)
+        if keep_debug:
+            gen.save(out_dir / "_debug" / f"repair_{i:02d}.png")
+        for tmp in (run_dir / work_name, run_dir / cut_name):
+            Path(tmp).unlink(missing_ok=True)
+
+        # 高清输出坐标 → 源图坐标
+        sx, sy = cw / ow, ch / oh
+        row.update({
+            "file": fname, "png_w": icon_img.width, "png_h": icon_img.height,
+            "paste_x": int(round(x0 + tight[0] * sx)),
+            "paste_y": int(round(y0 + tight[1] * sy)),
+            "paste_w": max(1, int(round((tight[2] - tight[0]) * sx))),
+            "paste_h": max(1, int(round((tight[3] - tight[1]) * sy))),
+        })
+        return row
+
+    started = time.time()
+    rows = []
+    for i, ic in enumerate(icons):
+        try:
+            rows.append(_one(i, ic))
+        except Exception as e:  # 单个失败不拖垮整批
+            rows.append({"index": i, "file": "", "status": f"error: {e}",
+                         "cx": ic["bbox"][0], "cy": ic["bbox"][1],
+                         "w": ic["bbox"][2], "h": ic["bbox"][3],
+                         "conf": round(float(ic.get("conf", 1.0)), 4),
+                         "paste_x": 0, "paste_y": 0, "paste_w": 0,
+                         "paste_h": 0, "png_w": 0, "png_h": 0})
+
+    # Qwen 用完即卸,不常驻显存(free_after 传 false 可保留缓存连跑多批)
+    if bool(payload.get("free_after", True)):
+        comfy.free_models()
+
+    fields = ["index", "file", "status", "cx", "cy", "w", "h", "conf",
+              "paste_x", "paste_y", "paste_w", "paste_h", "png_w", "png_h"]
+    manifest_path = out_dir / "manifest.csv"
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    canvas = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+    for row in rows:
+        if row["file"] and row["paste_w"] > 0:
+            with Image.open(out_dir / row["file"]) as p:
+                piece = p.convert("RGBA").resize(
+                    (row["paste_w"], row["paste_h"]), Image.Resampling.LANCZOS)
+            canvas.alpha_composite(piece, (row["paste_x"], row["paste_y"]))
+    canvas.save(out_dir / "recompose.png")
+
+    n_ok = sum(1 for r in rows if r["file"])
+    return {
+        "count": len(rows), "ok": n_ok,
+        "statuses": {s: sum(1 for r in rows if r["status"] == s)
+                     for s in {r["status"] for r in rows}},
+        "manifest": str(manifest_path),
+        "recompose": str(out_dir / "recompose.png"),
+        "source_size": [sw, sh],
+        "elapsed_sec": round(time.time() - started, 1),
+    }
+
+
+# 单图版(默认,use_ref=False):无原图参照,定位成"忠实修复"而非创作,
+# 防止模型在没有真相参照时自由发挥(实测会乱生成)
+DEFAULT_ICON_ASSET_PROMPT_SINGLE = (
+    "这是一张游戏UI图标\"{name}\"的抠图,放在纯{bg}色背景上。"
+    "这是一个图像修复任务,不是创作任务。"
+    "请对图中已有的图形做忠实的高清修复:提高清晰度、平整色块、锐化边缘,"
+    "清除边缘残留的杂色、背景色块和碎片,修补明显的涂抹破损。"
+    "必须保持图形的形状、比例、结构、配色、朝向与输入完全一致:"
+    "不允许重新设计、简化、美化或替换任何部分,"
+    "不要根据名称想象输入中不存在的细节。"
+    "严禁添加输入中没有的任何元素——底座、托盘、支架、平台、"
+    "阴影、倒影、光效、描边、装饰、文字一律不允许。"
+    "背景保持纯{bg}色,纯净均匀,不得出现任何图形、色带或渐变。"
+)
+
+DEFAULT_ICON_ASSET_PROMPT = (
+    "图2是从游戏UI(图1)中抠出来的图标\"{name}\",放在纯色背景上。"
+    "它可能因为去文字处理导致局部纹理涂抹混乱,也可能因为抠图导致边缘粘连了背景杂色。"
+    "请参考图1中它的原始形态,重新绘制这个图标:修复破损与混乱区域、清除边缘杂色,"
+    "严格保持图标原有的风格、配色、构图、轮廓和朝向不变,"
+    "只绘制这个图标本体(含其专属底座),忽略并清除图2中残留的其它图形碎片。"
+    "输出高清、边缘锐利的版本。背景必须保持与图2完全相同的纯{bg}色,"
+    "纯净均匀,不要在背景上添加任何图形、色带或阴影,不要添加任何文字。"
+)
+
+
+def build_qwen_edit_plus_workflow(image1_name: str, image2_name: str,
+                                  prompt: str, seed: int, steps: int,
+                                  cfg: float = 2.5, denoise: float = 1.0,
+                                  megapixels: float = 1.0) -> dict:
+    """Qwen-Image-Edit 2511 双图参照编辑(Plus 节点,ComfyUI API 格式)。
+
+    image1 为参照(UI 上下文),image2 为编辑底图——采样 latent 取自 image2,
+    输出尺寸跟随 image2(缩放到 megapixels)。
+    """
+    return {
+        "unet": {"class_type": "UNETLoader",
+                 "inputs": {"unet_name": "qwen_image_edit.safetensors",
+                            "weight_dtype": "default"}},
+        "shift": {"class_type": "ModelSamplingAuraFlow",
+                  "inputs": {"model": ["unet", 0], "shift": 3.1}},
+        "cfgnorm": {"class_type": "CFGNorm",
+                    "inputs": {"model": ["shift", 0], "strength": 1.0}},
+        "clip": {"class_type": "CLIPLoader",
+                 "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                            "type": "qwen_image"}},
+        "vae": {"class_type": "VAELoader",
+                "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+        "load1": {"class_type": "LoadImage", "inputs": {"image": image1_name}},
+        "load2": {"class_type": "LoadImage", "inputs": {"image": image2_name}},
+        "scale2": {"class_type": "ImageScaleToTotalPixels",
+                   "inputs": {"image": ["load2", 0], "upscale_method": "lanczos",
+                              "megapixels": megapixels, "resolution_steps": 16}},
+        "pos": {"class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": {"clip": ["clip", 0], "vae": ["vae", 0],
+                           "image1": ["load1", 0], "image2": ["scale2", 0],
+                           "prompt": prompt}},
+        "neg": {"class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": {"clip": ["clip", 0], "vae": ["vae", 0],
+                           "image1": ["load1", 0], "image2": ["scale2", 0],
+                           "prompt": ""}},
+        "encode": {"class_type": "VAEEncode",
+                   "inputs": {"pixels": ["scale2", 0], "vae": ["vae", 0]}},
+        "sample": {"class_type": "KSampler",
+                   "inputs": {"model": ["cfgnorm", 0], "positive": ["pos", 0],
+                              "negative": ["neg", 0], "latent_image": ["encode", 0],
+                              "seed": seed, "steps": steps, "cfg": cfg,
+                              "sampler_name": "euler", "scheduler": "simple",
+                              "denoise": denoise}},
+        "decode": {"class_type": "VAEDecode",
+                   "inputs": {"samples": ["sample", 0], "vae": ["vae", 0]}},
+        "save": {"class_type": "SaveImage",
+                 "inputs": {"images": ["decode", 0],
+                            "filename_prefix": "icon_asset"}},
+    }
+
+
+CHROMA_CANDIDATES = [(255, 0, 255), (0, 255, 0)]  # 品红 / 绿
+
+
+def _pick_chroma(icon_rgba: Image.Image):
+    """选一个离 icon 调色板最远的底色(防止图标撞色被泛洪击穿)。"""
+    thumb = icon_rgba.convert("RGBA").resize((64, 64))
+    pixels = [(r, g, b) for r, g, b, a in thumb.getdata() if a > 128]
+    if not pixels:
+        return CHROMA_CANDIDATES[0]
+
+    def worst_dist(c):
+        return min((r - c[0]) ** 2 + (g - c[1]) ** 2 + (b - c[2]) ** 2
+                   for r, g, b in pixels)
+
+    return max(CHROMA_CANDIDATES, key=worst_dist)
+
+
+def _border_median_color(rgb: Image.Image) -> tuple:
+    """输出图边框一圈像素的逐通道中位数——Qwen 会把底色"和谐"跑偏,
+    以它实际画出来的底色为准,而不是我们发送时的底色。"""
+    small = rgb.copy()
+    small.thumbnail((256, 256))
+    w, h = small.size
+    data = small.load()
+    px = []
+    for x in range(w):
+        px.append(data[x, 0])
+        px.append(data[x, h - 1])
+    for y in range(h):
+        px.append(data[0, y])
+        px.append(data[w - 1, y])
+    mid = len(px) // 2
+    return tuple(sorted(c[i] for c in px)[mid] for i in range(3))
+
+
+def _unkey_border(img: Image.Image, tol: int = 60,
+                  defringe: int = 1) -> Image.Image:
+    """全局色键去底(底色自适应):
+    1. 以"边框中位色"为键色(Qwen 会把底色画跑偏,以实际输出为准),
+       全图凡接近键色的一律透明——底色本就按"离图标调色板最远"自适应挑选,
+       全局键安全,且能清掉镂空 icon 内部的封闭底色区;
+    2. 清除仍与边界连通的不透明残留(模型偶发的黑边条/杂色带),
+       真图标居中且有 pad 不会贴边;若清完全空则回退不清;
+    3. alpha 收缩 defringe 像素,消掉边缘 1px 混色晕。"""
+    rgb = img.convert("RGB")
+    key = _border_median_color(rgb)
+    diff = ImageChops.difference(rgb, Image.new("RGB", rgb.size, key))
+    # 每通道差值取最大近似色距;point 后 0=接近底色,255=图标内容
+    r, g, b = diff.split()
+    dist = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    binary = dist.point(lambda v: 0 if v <= tol else 255).convert("L")
+    # 色相键补刀:模型常拿底色画投影/描边(同色相但明暗不同,RGB 距离抓不住),
+    # 与键色同色相且饱和度高的一律并入底色。底色是按"远离图标调色板"自适应
+    # 挑的,图标本体几乎不会撞到这个色相。
+    hsv = rgb.convert("HSV")
+    hch, sch, vch = hsv.getchannel("H"), hsv.getchannel("S"), hsv.getchannel("V")
+    key_h = Image.new("RGB", (1, 1), key).convert("HSV").getpixel((0, 0))[0]
+    hd = hch.point(lambda h: min(abs(h - key_h), 256 - abs(h - key_h)))
+    hue_close = hd.point(lambda v: 255 if v <= 18 else 0)
+    saturated = sch.point(lambda v: 255 if v >= 90 else 0)
+    # 明度下限:深色像素的色相值不稳定(黑色描边会被误伤),V<60 一律豁免
+    bright = vch.point(lambda v: 255 if v >= 60 else 0)
+    hue_key = ImageChops.multiply(ImageChops.multiply(hue_close, saturated),
+                                  bright)  # 255=命中色相键
+    binary = ImageChops.subtract(binary, hue_key)  # 命中处归 0(视作底色)
+    w, h = binary.size
+    border = ([(x, y) for x in range(w) for y in (0, h - 1)]
+              + [(x, y) for y in range(h) for x in (0, w - 1)])
+    # 贴边的"内容"残留染 64(候删)
+    for x, y in border:
+        if binary.getpixel((x, y)) == 255:
+            ImageDraw.floodfill(binary, (x, y), 64)
+    hist = binary.histogram()
+    junk_ok = hist[255] > w * h * 0.005  # 清完还有足量内容才生效
+    alpha = binary.point(
+        lambda v: 255 if (v == 255 or (not junk_ok and v == 64)) else 0)
+    if defringe > 0:
+        alpha = alpha.filter(ImageFilter.MinFilter(2 * defringe + 1))
+    out = rgb.convert("RGBA")
+    out.putalpha(alpha)
+    return out
+
+
+def handle_icon_asset(payload: dict) -> dict:
+    """第 8 步素材化:每组 icon 出一张高清透明素材(组内成员共用)。
+
+    链路:选组内最大成员 → 上下文裁块(图1) + SAM2 抠图合成纯色底(图2)
+    → Qwen-Image-Edit 双图参照重绘 → 边界泛洪去底 → 最小透明 PNG。
+    manifest.csv 记录组内每个成员的回贴矩形(fit-inside 居中,等比不拉伸)。
+
+    payload:
+        run_id / dir   二选一
+        groups         必填 [{"name","slug","bbox":[[cx,cy,w,h],...]}, ...](归一化)
+        image          上下文源图,默认 text_back.png
+        cutout         SAM2 提取层,默认 icons.png(需先跑完提icon步骤)
+        use_ref        (Qwen 重绘通道停用中,此参数暂不生效)
+                       原语义:False=单图重绘,True=带上下文裁块双图参照
+        pad_ratio / min_pad    裁块外扩,默认 0.3 / 16
+        prompt         可选,{name} 占位符会被组名替换
+        seed / steps / cfg / denoise / megapixels    Qwen 参数
+        tol            泛洪容差,默认 60
+        keep_debug     默认 True,重绘原图留在 icon_assets/_debug/
+
+    输出:icon_assets/<slug>.png + manifest.csv + recompose.png
+    """
+    if payload.get("dir"):
+        run_dir = Path(payload["dir"])
+    else:
+        run_dir = storage.get_run_dir(payload["run_id"])
+    groups = payload.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("payload.groups must be a non-empty array")
+
+    src_path = run_dir / (payload.get("image") or "text_back.png")
+    cut_path = run_dir / (payload.get("cutout") or "icons.png")
+    for p in (src_path, cut_path):
+        if not p.is_file():
+            raise FileNotFoundError(f"input not found: {p}")
+    with Image.open(src_path) as im:
+        src = im.convert("RGB")
+    with Image.open(cut_path) as im:
+        cut_layer = im.convert("RGBA")
+    sw, sh = src.size
+    if cut_layer.size != src.size:
+        cut_layer = cut_layer.resize(src.size, Image.Resampling.LANCZOS)
+
+    use_ref = bool(payload.get("use_ref", False))
+    pad_ratio = float(payload.get("pad_ratio", 0.3))
+    min_pad = int(payload.get("min_pad", 16))
+    seed = int(payload.get("seed", 5))
+    steps = int(payload.get("steps", 20))
+    cfg = float(payload.get("cfg", 2.5))
+    denoise = float(payload.get("denoise", 1.0))
+    megapixels = float(payload.get("megapixels", 1.0))
+    tol = int(payload.get("tol", 60))
+    keep_debug = bool(payload.get("keep_debug", True))
+
+    out_dir = run_dir / "icon_assets"
+    out_dir.mkdir(exist_ok=True)
+    if keep_debug:
+        (out_dir / "_debug").mkdir(exist_ok=True)
+
+    def _px_rect(bbox):
+        cx, cy, w, h = bbox
+        return ((cx - w / 2) * sw, (cy - h / 2) * sh,
+                (cx + w / 2) * sw, (cy + h / 2) * sh)
+
+    def _one(group: dict) -> dict:
+        slug = group["slug"]
+        name = group.get("name", slug)
+        bboxes = group["bbox"]
+        # 选组内面积最大的成员当源(有效分辨率最高)
+        rects = [_px_rect(b) for b in bboxes]
+        bi = max(range(len(rects)),
+                 key=lambda i: (rects[i][2] - rects[i][0]) * (rects[i][3] - rects[i][1]))
+        bx0, by0, bx1, by1 = rects[bi]
+        pad = max(min_pad, round(max(bx1 - bx0, by1 - by0) * pad_ratio))
+        x0, y0 = max(0, int(bx0 - pad)), max(0, int(by0 - pad))
+        x1 = min(sw, int(math.ceil(bx1 + pad)))
+        y1 = min(sh, int(math.ceil(by1 + pad)))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return {"slug": slug, "status": "too_small"}
+
+        ctx_crop = src.crop((x0, y0, x1, y1))
+        cut_crop = cut_layer.crop((x0, y0, x1, y1))
+        # 只保留成员 bbox(外扩 15%)内的抠图像素:裁块 pad 里常混入邻近 icon
+        # 的抠图,不隔离会被 Qwen 一起画进素材
+        mm = max(8, round(max(bx1 - bx0, by1 - by0) * 0.15))
+        keep = Image.new("L", cut_crop.size, 0)
+        ImageDraw.Draw(keep).rectangle(
+            [bx0 - x0 - mm, by0 - y0 - mm, bx1 - x0 + mm, by1 - y0 + mm],
+            fill=255)
+        cut_crop.putalpha(
+            ImageChops.multiply(cut_crop.getchannel("A"), keep))
+
+        # —— 当前通道:直接从抠图层(icons.png)裁块落库,Qwen 重绘已停用 ——
+        tight = cut_crop.getchannel("A").getbbox()
+        if not tight:
+            return {"slug": slug, "status": "empty_cutout"}
+        asset = cut_crop.crop(tight)
+        status = "direct"
+        bg = (0, 0, 0)
+        fname = f"{slug}.png"
+        asset.save(out_dir / fname)
+
+        # —— Qwen 重绘通道(停用中,恢复时取消下面整段注释并删除上面的直裁段) ——
+        # bg = _pick_chroma(cut_crop)
+        # base = Image.new("RGB", cut_crop.size, bg)
+        # base.paste(cut_crop, (0, 0), cut_crop)
+
+        # img2 = comfy.place_input_pil(base, prefix=f"asset_cut_{slug[:24]}_")
+        # bg_name = "品红" if bg == (255, 0, 255) else "绿"
+        # if use_ref:
+        #     img1 = comfy.place_input_pil(
+        #         ctx_crop, prefix=f"asset_ctx_{slug[:24]}_")
+        #     prompt = (payload.get("prompt") or DEFAULT_ICON_ASSET_PROMPT)
+        #     workflow = build_qwen_edit_plus_workflow(
+        #         img1, img2,
+        #         prompt.replace("{name}", name).replace("{bg}", bg_name),
+        #         seed, steps, cfg, denoise, megapixels)
+        # else:
+        #     prompt = (payload.get("prompt")
+        #               or DEFAULT_ICON_ASSET_PROMPT_SINGLE)
+        #     workflow = build_qwen_edit_workflow(
+        #         img2, prompt.replace("{name}", name).replace("{bg}", bg_name),
+        #         seed, steps, cfg, denoise, megapixels)
+        # entry = comfy.run_workflow(workflow)
+        # images = comfy.output_image_paths(entry)
+        # if not images:
+        #     return {"slug": slug, "status": "comfy_no_output"}
+        # with Image.open(images[0]) as g:
+        #     gen = g.convert("RGB")
+        # if keep_debug:
+        #     gen.save(out_dir / "_debug" / f"{slug}_raw.png")
+
+        # rgba = _unkey_border(gen, tol, int(payload.get("defringe", 1)))
+        # tight = rgba.getchannel("A").getbbox()
+        # status = "ok"
+        # if not tight:
+        #     # 泛洪全键掉了(生成图整体接近底色)——退化为整图不透明
+        #     status = "unkey_empty"
+        #     rgba = gen.convert("RGBA")
+        #     tight = (0, 0, rgba.width, rgba.height)
+        # else:
+        #     # 底色渗入检查:不透明占比过高说明没抠动,标记供人工复核
+        #     area = (tight[2] - tight[0]) * (tight[3] - tight[1])
+        #     opaque = sum(1 for a in rgba.crop(tight).getchannel("A").getdata()
+        #                  if a > 0)
+        #     if area > 0 and opaque / area > 0.98:
+        #         status = "unkey_suspect"
+        # asset = rgba.crop(tight)
+        # asset.save(out_dir / f"{slug}.png")
+        # 组内每个成员一条回贴记录:素材等比 fit 进各自 bbox,居中
+        members = []
+        aw, ah = asset.size
+        for mi, (mx0, my0, mx1, my1) in enumerate(rects):
+            bw, bh = mx1 - mx0, my1 - my0
+            s = min(bw / aw, bh / ah) if aw and ah else 0
+            pw, ph = max(1, round(aw * s)), max(1, round(ah * s))
+            members.append({
+                "member": mi, "bbox": bboxes[mi],
+                "paste_x": int(round(mx0 + (bw - pw) / 2)),
+                "paste_y": int(round(my0 + (bh - ph) / 2)),
+                "paste_w": pw, "paste_h": ph,
+            })
+        return {"slug": slug, "name": name, "status": status,
+                "file": f"{slug}.png", "png_w": aw, "png_h": ah,
+                "source_member": bi, "bg": f"{bg[0]},{bg[1]},{bg[2]}",
+                "members": members}
+
+    started = time.time()
+    # 先清掉本批将要生成的旧素材:前端靠"文件出现"做逐个即时显示,
+    # 旧文件残留会被误认为新结果
+    for group in groups:
+        slug = group.get("slug")
+        if slug:
+            (out_dir / f"{slug}.png").unlink(missing_ok=True)
+    results = []
+    for group in groups:
+        try:
+            results.append(_one(group))
+        except Exception as e:  # 单组失败不拖垮整批
+            results.append({"slug": group.get("slug", "?"),
+                            "status": f"error: {e}"})
+
+    fields = ["slug", "name", "status", "file", "png_w", "png_h", "bg",
+              "member", "cx", "cy", "w", "h",
+              "paste_x", "paste_y", "paste_w", "paste_h"]
+    manifest_path = out_dir / "manifest.csv"
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in results:
+            base_row = {k: r.get(k, "") for k in
+                        ("slug", "name", "status", "file", "png_w", "png_h", "bg")}
+            for m in r.get("members", [{}]):
+                row = dict(base_row)
+                if m:
+                    row.update({
+                        "member": m["member"],
+                        "cx": m["bbox"][0], "cy": m["bbox"][1],
+                        "w": m["bbox"][2], "h": m["bbox"][3],
+                        "paste_x": m["paste_x"], "paste_y": m["paste_y"],
+                        "paste_w": m["paste_w"], "paste_h": m["paste_h"],
+                    })
+                writer.writerow(row)
+
+    n_ok = sum(1 for r in results if r.get("file"))
+    return {
+        "count": len(results), "ok": n_ok,
+        "statuses": {s: sum(1 for r in results if r["status"] == s)
+                     for s in {r["status"] for r in results}},
+        "manifest": str(manifest_path),
+        # 叠放显示数据:前端按 members 的回贴矩形绝对定位,不再服务端拼图
+        "assets": [{"slug": r["slug"], "file": r["file"],
+                    "status": r["status"], "members": r.get("members", [])}
+                   for r in results if r.get("file")],
+        "source_size": [sw, sh],
+        "elapsed_sec": round(time.time() - started, 1),
+    }
+
+
 def register_all() -> None:
     worker.register("hello", handle_hello)
     worker.register("text_back", handle_text_back)
@@ -681,3 +1518,5 @@ def register_all() -> None:
     worker.register("omnipsd", handle_omnipsd)
     worker.register("yolo", handle_yolo)
     worker.register("sam2", handle_sam2)
+    worker.register("icon_repair", handle_icon_repair)
+    worker.register("icon_asset", handle_icon_asset)

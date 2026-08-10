@@ -98,7 +98,8 @@ def get_run_file(run_id: str, filename: str):
         raise HTTPException(403, "path escapes run dir")
     if not path.is_file():
         raise HTTPException(404, f"file not found: {filename}")
-    return FileResponse(path)
+    # run 文件会被覆写(text_back 残字补洞、icons 修正重抠等),禁止浏览器缓存
+    return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/runs/{run_id}/files/{filename}")

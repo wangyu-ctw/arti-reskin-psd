@@ -29,21 +29,38 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("YOLOD_PORT", "8190"))
-MODEL_PATH = os.environ.get(
-    "YOLO_MODEL", "/workspace/ui_skin/pretrained/yolo/yolo_ui_element_best.pt")
+# 多模型注册表:请求可用 "model" 字段按 key 选择;默认模型启动即载,其余懒加载缓存
+MODEL_PATHS = {
+    "game0804_11m": "/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt",
+    "game0804_p2": "/workspace/ui_skin/pretrained/yolo/yolo_game0804_p2_best.pt",
+    "game0728_p2": "/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt",
+}
+# 兼容旧环境变量:YOLO_MODEL 指定的路径注册为 "env" 并作为默认
+if os.environ.get("YOLO_MODEL"):
+    MODEL_PATHS["env"] = os.environ["YOLO_MODEL"]
+DEFAULT_MODEL = os.environ.get(
+    "YOLO_DEFAULT_MODEL", "env" if "env" in MODEL_PATHS else "game0804_11m")
 
-model = None
+_models: dict = {}
 sahi_model = None
 predict_lock = threading.Lock()
 
 
+def get_model(key: str):
+    """按 key 取模型,未加载则现场加载并缓存(每个 ~40M,常驻显存无压力)。"""
+    if key not in MODEL_PATHS:
+        raise ValueError(f"unknown model {key!r}, available: {sorted(MODEL_PATHS)}")
+    if key not in _models:
+        os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+        from ultralytics import YOLO
+        print(f"loading YOLO[{key}] from {MODEL_PATHS[key]} ...", flush=True)
+        _models[key] = YOLO(MODEL_PATHS[key])
+        print(f"YOLO[{key}] ready", flush=True)
+    return _models[key]
+
+
 def load_model() -> None:
-    global model
-    os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
-    from ultralytics import YOLO
-    print(f"loading YOLO from {MODEL_PATH} ...", flush=True)
-    model = YOLO(MODEL_PATH)
-    print("YOLO ready", flush=True)
+    get_model(DEFAULT_MODEL)
 
 
 def _get_sahi_model(conf: float):
@@ -52,7 +69,7 @@ def _get_sahi_model(conf: float):
     from sahi import AutoDetectionModel
     if sahi_model is None:
         sahi_model = AutoDetectionModel.from_pretrained(
-            model_type="ultralytics", model_path=MODEL_PATH,
+            model_type="ultralytics", model_path=MODEL_PATHS[DEFAULT_MODEL],
             confidence_threshold=conf, device="cuda:0",
         )
     else:
@@ -97,6 +114,7 @@ def detect(req: dict) -> dict:
     if req.get("slice"):
         return _detect_sliced(image_path, conf, int(req.get("slice_size", 640)))
 
+    model = get_model(str(req.get("model") or DEFAULT_MODEL))
     results = model.predict(
         source=str(image_path), imgsz=imgsz, conf=conf, iou=iou,
         augment=augment, device=0, verbose=False,
@@ -123,7 +141,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"ok": model is not None})
+            self._send(200, {"ok": DEFAULT_MODEL in _models,
+                             "loaded": sorted(_models),
+                             "available": sorted(MODEL_PATHS),
+                             "default": DEFAULT_MODEL})
         else:
             self._send(404, {"error": "not found"})
 

@@ -79,7 +79,15 @@ const MODES: Record<string, SeekMode> = {
     },
     output: 'seedseek_fill.png',
     needsRun: true,
-    params: { ...FILL_PARAMS },
+    params: {
+      prompt: stepDefaults.midFill.prompt,
+      steps: stepDefaults.midFill.steps,
+      guidance: stepDefaults.midFill.guidance,
+      grow_mask: stepDefaults.midFill.growMask,
+      mask_blur: stepDefaults.midFill.maskBlur,
+      max_pixels: stepDefaults.midFill.maxPixels,
+      fill_holes: stepDefaults.midFill.fillHoles,
+    },
   },
 }
 

@@ -1,7 +1,7 @@
 import { Button, Card, Checkbox, Input, InputNumber, Popover, Spin } from 'antd'
 import { SettingOutlined } from '@ant-design/icons'
 import {
-  DEFAULT_ICON_BACK_PROMPT,
+  DEFAULT_MID_FILL_PROMPT,
   useDetectionStore,
 } from '../stores/useDetectionStore'
 
@@ -72,7 +72,7 @@ function SettingsPopover() {
             <TextArea
               value={midFillPrompt}
               onChange={(e) => setField('midFillPrompt', e.target.value)}
-              placeholder={DEFAULT_ICON_BACK_PROMPT}
+              placeholder={DEFAULT_MID_FILL_PROMPT}
               rows={4}
             />
           </div>

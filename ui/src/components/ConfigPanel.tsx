@@ -23,6 +23,7 @@ export default function ConfigPanel() {
     systemPrompt,
     userPrompt,
     yoloResult,
+    yoloModel,
     isYoloRunning,
     yoloError,
     runInfo,
@@ -106,6 +107,17 @@ export default function ConfigPanel() {
           <div className="mb-2 flex items-center justify-between">
             <span className="text-[13px] font-bold">YOLO结果</span>
             <div className="flex gap-2">
+              <Select
+                size="small"
+                className="w-32"
+                value={yoloModel}
+                onChange={(v) => setField('yoloModel', v)}
+                options={[
+                  { value: 'game0804_11m', label: '11m·新数据' },
+                  { value: 'game0804_p2', label: 'P2·新数据' },
+                  { value: 'game0728_p2', label: 'P2·旧' },
+                ]}
+              />
               <Button
                 size="small"
                 disabled={!yoloResult.trim()}

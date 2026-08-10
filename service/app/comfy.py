@@ -60,6 +60,18 @@ def ensure_up() -> None:
     )
 
 
+def free_models() -> None:
+    """让 ComfyUI 卸载全部已加载模型,释放显存(下次任务冷加载,约多等几十秒)。
+
+    用于 Qwen-Image-Edit 这类"偶尔用一次"的大模型:用完即卸,不常驻缓存。
+    注意 ComfyUI 的 /free 是全量卸载,FLUX 系也会一并被卸。
+    """
+    try:
+        _http("POST", "/free", {"unload_models": True}, timeout=30)
+    except Exception:
+        pass
+
+
 def place_input_image(src: Path, prefix: str = "") -> str:
     """把输入图拷进 ComfyUI 的 input 目录,返回 LoadImage 用的文件名。"""
     name = f"{prefix}{uuid.uuid4().hex[:8]}{src.suffix}"

@@ -102,23 +102,31 @@ def cutout(req: dict) -> dict:
     size_rules = req.get("size_rules") or []
     TUNABLE = ("padding_ratio", "min_padding", "mask_threshold",
                "feather_radius", "crop_scale")
+    BOOL_TUNABLE = ("refine", "multimask", "fill_holes")
 
     def effective_params(border, side_px):
         eff = {"padding_ratio": padding_ratio, "min_padding": min_padding,
                "mask_threshold": mask_threshold, "feather_radius": feather_radius,
-               "crop_scale": crop_scale}
+               "crop_scale": crop_scale, "refine": refine,
+               "multimask": multimask, "fill_holes": fill_holes}
         for rule in size_rules:
             lo, hi = rule.get("min_side"), rule.get("max_side")
             if (lo is None or side_px >= float(lo)) and (hi is None or side_px <= float(hi)):
                 for k in TUNABLE:
                     if rule.get(k) is not None:
                         eff[k] = float(rule[k])
+                for k in BOOL_TUNABLE:
+                    if rule.get(k) is not None:
+                        eff[k] = bool(rule[k])
                 break
         # border 内联覆盖,优先级最高(为未来逐 icon 定制留的通道)
         inline = border.get("params") or {}
         for k in TUNABLE:
             if inline.get(k) is not None:
                 eff[k] = float(inline[k])
+        for k in BOOL_TUNABLE:
+            if inline.get(k) is not None:
+                eff[k] = bool(inline[k])
         return eff
 
     with Image.open(image_path) as im:
@@ -217,12 +225,12 @@ def cutout(req: dict) -> dict:
                     point_coords=point_coords,
                     point_labels=point_labels,
                     box=box,
-                    multimask_output=multimask,
+                    multimask_output=eff["multimask"],
                     return_logits=False,
                 )
                 best = int(np.argmax(scores))
                 mask, score = masks[best], float(scores[best])
-                if refine:
+                if eff["refine"]:
                     # 首轮低分辨率 logits 作为 mask_input,同一组提示再精化一轮
                     masks2, scores2, _ = predictor.predict(
                         point_coords=point_coords,
@@ -263,7 +271,7 @@ def cutout(req: dict) -> dict:
                                      "source": chosen_src,
                                      "scores": scores_by_src})
 
-            if fill_holes:
+            if eff["fill_holes"]:
                 # 每个 icon 的 mask 单独封孔,抠出的图层实心无镂空
                 mask = fill_mask_holes(mask)
             if override_mask is not None and chosen_src == "alt":
@@ -303,8 +311,95 @@ def cutout(req: dict) -> dict:
     opaque = int((alpha > 0).sum())
     return {"output_path": str(out_path), "num_boxes": used,
             "size": [width, height], "opaque_pixels": opaque,
-            "crop_scale": crop_scale if use_crop else 0, "refine": refine,
+            "crop_scale": eff["crop_scale"] if use_crop else 0, "refine": eff["refine"],
             "sources": source_stats}
+
+
+def refine_bboxes(req: dict) -> dict:
+    """bbox 几何回投:每个 YOLO 框作为 box 提示跑一次分割,用 mask 的紧致外接框替换原框。
+
+    治"检测框小了一截":box 只是软提示,mask 会长到元素的真实边界。
+    护栏(任一不满足则保留原框):新旧框 IoU ≥ min_iou、面积膨胀 ≤ max_grow、
+    面积收缩 ≥ min_shrink(防止 mask 只抓住元素一部分反而把框改小)。
+
+    请求:{dir, image, borders:[{bbox:[cx,cy,w,h]}], crop_scale=1.5,
+          mask_threshold=0.5, min_iou=0.3, max_grow=1.5, min_shrink=0.5}
+    响应:{bboxes:[{bbox, refined, iou}]},与 borders 一一对应。
+    """
+    run_dir = Path(req["dir"])
+    image_path = run_dir / req["image"]
+    if not image_path.is_file():
+        raise FileNotFoundError(f"input image not found: {image_path}")
+    borders = req.get("borders") or []
+    crop_scale = float(req.get("crop_scale", 1.5))
+    thr = float(req.get("mask_threshold", 0.5))
+    min_iou = float(req.get("min_iou", 0.3))
+    max_grow = float(req.get("max_grow", 1.5))
+    min_shrink = float(req.get("min_shrink", 0.5))
+
+    with Image.open(image_path) as im:
+        arr = np.asarray(ImageOps.exif_transpose(im).convert("RGB"))
+    rgb = np.ascontiguousarray(arr)
+    height, width = rgb.shape[:2]
+
+    def rect_iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    out = []
+    use_amp = torch.cuda.is_available()
+    amp = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+    predictor.mask_threshold = thr
+    with torch.inference_mode(), amp:
+        for border in borders:
+            cx, cy, w, h = (float(v) for v in border["bbox"][:4])
+            x1 = clamp((cx - w / 2) * width, 0, width - 1)
+            y1 = clamp((cy - h / 2) * height, 0, height - 1)
+            x2 = clamp((cx + w / 2) * width, 1, width)
+            y2 = clamp((cy + h / 2) * height, 1, height)
+            item = {"bbox": [cx, cy, w, h], "refined": False, "iou": 1.0}
+            if x2 - x1 < 2 or y2 - y1 < 2:
+                out.append(item)
+                continue
+            # 以框为中心裁 crop_scale 倍切片(至少 64px),小元素有效分辨率更高
+            bcx, bcy = (x1 + x2) / 2, (y1 + y2) / 2
+            half_w = max((x2 - x1) * crop_scale / 2, 32)
+            half_h = max((y2 - y1) * crop_scale / 2, 32)
+            ox1 = int(clamp(bcx - half_w, 0, width - 1))
+            oy1 = int(clamp(bcy - half_h, 0, height - 1))
+            ox2 = int(clamp(round(bcx + half_w), 1, width))
+            oy2 = int(clamp(round(bcy + half_h), 1, height))
+            predictor.set_image(np.ascontiguousarray(rgb[oy1:oy2, ox1:ox2]))
+            masks, scores, _ = predictor.predict(
+                box=np.asarray([x1 - ox1, y1 - oy1, x2 - ox1, y2 - oy1],
+                               dtype=np.float32),
+                multimask_output=False,
+                return_logits=False,
+            )
+            mask = masks[int(np.argmax(scores))].astype(bool)
+            ys, xs = np.nonzero(mask)
+            if len(ys) == 0:
+                out.append(item)
+                continue
+            nx1, nx2 = ox1 + xs.min(), ox1 + xs.max() + 1
+            ny1, ny2 = oy1 + ys.min(), oy1 + ys.max() + 1
+            iou = rect_iou((x1, y1, x2, y2), (nx1, ny1, nx2, ny2))
+            old_area = (x2 - x1) * (y2 - y1)
+            new_area = (nx2 - nx1) * (ny2 - ny1)
+            ratio = new_area / old_area if old_area > 0 else 0
+            if iou >= min_iou and min_shrink <= ratio <= max_grow:
+                item = {
+                    "bbox": [((nx1 + nx2) / 2) / width, ((ny1 + ny2) / 2) / height,
+                             (nx2 - nx1) / width, (ny2 - ny1) / height],
+                    "refined": True,
+                    "iou": round(float(iou), 4),
+                }
+            out.append(item)
+    predictor.reset_predictor()
+    return {"bboxes": out}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -323,14 +418,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/cutout":
+        if self.path not in ("/cutout", "/refine_bbox"):
             self._send(404, {"error": "not found"})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(length))
             with predict_lock:
-                result = cutout(req)
+                result = (cutout(req) if self.path == "/cutout"
+                          else refine_bboxes(req))
             self._send(200, result)
         except Exception:
             tb = traceback.format_exc()
