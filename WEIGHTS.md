@@ -55,23 +55,24 @@ icon_asset 链路(第 8+ 步素材化,2026-08-07 上线):第 7 步分组(name/sl
 | SAM2(抠图,icon 专项续训 step-1000:贴轮廓环带负点治底座误判,val icon 0.924) | `/workspace/outputs/sam2_icon_20260805/step-1000.pt` | 857M | 在役(2026-08-05 二次上线) |
 | SAM2 全类均衡版(step-7000,val IoU 0.890/基线 0.748) | `/workspace/outputs/sam2_train_20260805/step-7000.pt` | 857M | 回退备份 |
 | SAM2 官方原版 sam2.1_hiera_large | `/workspace/sam2/checkpoints/sam2.1_hiera_large.pt` | 857M | 回退备份(sam2d.sh 删掉 SAM2_CHECKPOINT 行即回退) |
-| YOLO game0804_p2(默认,新数据 P2,mAP50 0.701 / icon P 0.851) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_p2_best.pt` | 42M | 在役·默认(2026-08-06 切换) |
-| YOLO game0804_11m(mAP50 0.752) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt` | 39M | 在役·按需加载 |
-| YOLO game0728_p2(旧 P2) | `/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt` | 42M | 在役·按需加载 |
+| YOLO game0804_p2(默认,新数据 P2,mAP50 0.701 / icon P 0.851) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_p2_best.pt` | 42M | 在役·唯一注册(2026-08-12 起) |
+| YOLO game0804_11m(mAP50 0.752) | `/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt` | 39M | 已撤注册,文件保留 |
+| YOLO game0728_p2(旧 P2) | `/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt` | 42M | 已撤注册,文件保留 |
 
-YOLO 为三模型注册表(2026-08-06 起):daemon 同时挂三个权重,检测请求用 `model` 字段选择,
-前端第 3 步有下拉;默认由 yolod.sh 的 `YOLO_DEFAULT_MODEL` 指定(当前 game0804_p2,2026-08-06 起;此前 game0804_11m)。
+YOLO 注册表(2026-08-12 精简):daemon 只挂 game0804_p2 一个权重(前端下拉同步只剩它);
+历史权重与 panel_amodal 文件仍在 pretrained/yolo/,要 A/B 时在 yolo_daemon.py 的 MODEL_PATHS 加回即可。
+默认由 yolod.sh 的 `YOLO_DEFAULT_MODEL` 指定(当前 game0804_p2)。
 另:检测后默认做 SAM2 bbox 几何回投(refine_bbox,治框小一截;text/panel 类不回投)。
 | YOLO 旧版(game0804 的训练起点) | `/workspace/ui_skin/pretrained/yolo/yolo_ui_element_best.pt` | 39M | 回退备份 |
 
 YOLO 训练产物区:`/workspace/outputs/yolo_train/<name>/weights/best.pt`(game0804_from_old 即本次)。
 
-panel 专项 YOLO(amodal 全貌 bbox,单类 panel;已注册为 daemon 的 "panel_amodal" 可按需调用,前端入口已撤——实测效果差于 game0804_p2 的 panel 类,提升需加新游戏数据):
+panel 专项 YOLO(amodal 全貌 bbox,单类 panel;注册已撤、文件保留——实测效果差于 game0804_p2 的 panel 类,提升需加新游戏数据):
 `/workspace/ui_skin/pretrained/yolo/yolo_panel_amodal_20260811_best.pt`(39M)。
 数据 `/workspace/inputs/panel_yolo_20260811/`(786 训练/90 验证,ansatsu holdout,每 PSD 三态图 full/mid/stack 共享 amodal 标签)。
 v1 默认超参 mAP50 0.552;v2(AdamW 5e-4+余弦退火+fliplr)mAP50 0.570 / mAP50-95 0.372,即当前在役版。
 两版都是 best 停在前几个 epoch、后续过拟合——瓶颈是训练集游戏风格多样性(泛化到全新游戏就这个水平),
-提升需加游戏而非调参。接入 yolod.sh 三模型注册表即可上线(未接,等验收)。
+提升需加游戏而非调参。曾短暂接入第 15 步"新yolo"按钮,实测后撤下。
 
 ## 冷备通道(`text_back_cold`,diffsynth 直载,正常流程不触发)
 

@@ -113,9 +113,7 @@ export default function ConfigPanel() {
                 value={yoloModel}
                 onChange={(v) => setField('yoloModel', v)}
                 options={[
-                  { value: 'game0804_11m', label: '11m·新数据' },
                   { value: 'game0804_p2', label: 'P2·新数据' },
-                  { value: 'game0728_p2', label: 'P2·旧' },
                 ]}
               />
               <Button

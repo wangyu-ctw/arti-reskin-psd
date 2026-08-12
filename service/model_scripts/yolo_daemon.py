@@ -31,17 +31,14 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("YOLOD_PORT", "8190"))
 # 多模型注册表:请求可用 "model" 字段按 key 选择;默认模型启动即载,其余懒加载缓存
 MODEL_PATHS = {
-    "game0804_11m": "/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt",
+    # 只保留在役权重(P2·新数据);历史权重文件仍在 pretrained/yolo/ 可随时加回
     "game0804_p2": "/workspace/ui_skin/pretrained/yolo/yolo_game0804_p2_best.pt",
-    "game0728_p2": "/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt",
-    # panel 专项(amodal 全貌 bbox,单类 class0=panel;第 15 步"新yolo"用)
-    "panel_amodal": "/workspace/ui_skin/pretrained/yolo/yolo_panel_amodal_20260811_best.pt",
 }
 # 兼容旧环境变量:YOLO_MODEL 指定的路径注册为 "env" 并作为默认
 if os.environ.get("YOLO_MODEL"):
     MODEL_PATHS["env"] = os.environ["YOLO_MODEL"]
 DEFAULT_MODEL = os.environ.get(
-    "YOLO_DEFAULT_MODEL", "env" if "env" in MODEL_PATHS else "game0804_11m")
+    "YOLO_DEFAULT_MODEL", "env" if "env" in MODEL_PATHS else "game0804_p2")
 
 _models: dict = {}
 sahi_model = None
