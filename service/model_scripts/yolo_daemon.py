@@ -34,6 +34,8 @@ MODEL_PATHS = {
     "game0804_11m": "/workspace/ui_skin/pretrained/yolo/yolo_game0804_best.pt",
     "game0804_p2": "/workspace/ui_skin/pretrained/yolo/yolo_game0804_p2_best.pt",
     "game0728_p2": "/workspace/ui_skin/pretrained/yolo/yolo_game0728_p2_best.pt",
+    # panel 专项(amodal 全貌 bbox,单类 class0=panel;第 15 步"新yolo"用)
+    "panel_amodal": "/workspace/ui_skin/pretrained/yolo/yolo_panel_amodal_20260811_best.pt",
 }
 # 兼容旧环境变量:YOLO_MODEL 指定的路径注册为 "env" 并作为默认
 if os.environ.get("YOLO_MODEL"):

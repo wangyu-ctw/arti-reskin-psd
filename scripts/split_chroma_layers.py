@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""切分五等分色键图、移除底色，并按 UI 图层顺序重新合成。
+"""切分三等分色键 bar 分解图、移除底色，并把 bar 拼回在一起。
 
-默认输入布局（从左到右）：
-  1. reward_icons
-  2. current_progress_indicator
-  3. border
-  4. progress_fill
-  5. base_plate
+第 12+ 步的产物是三段布局（横向 bar → 三段竖排、黑色横分隔线；
+纵向 bar → 三段横排、黑色竖分隔线），脚本自动识别两种布局：
+  1. border         边框（严格中空）
+  2. progress_fill  进度内容
+  3. base_plate     底板
 
-默认合成顺序（从底到顶）：
-  base_plate -> progress_fill -> border -> reward_icons
-  -> current_progress_indicator
+合成顺序（从底到顶）：base_plate -> progress_fill -> border
 
 示例：
   python scripts/split_chroma_layers.py input.png --background '#00FF00'
   python scripts/split_chroma_layers.py input.png --background 0,255,0 \
-      --output-dir output/bar_layers
+      --output-dir output/bar_layers --layout rows
 """
 
 from __future__ import annotations
@@ -30,8 +27,6 @@ from PIL import Image
 
 
 DEFAULT_LAYER_NAMES = (
-    "reward_icons",
-    "current_progress_indicator",
     "border",
     "progress_fill",
     "base_plate",
@@ -40,8 +35,6 @@ DEFAULT_COMPOSITE_ORDER = (
     "base_plate",
     "progress_fill",
     "border",
-    "reward_icons",
-    "current_progress_indicator",
 )
 
 
@@ -132,7 +125,7 @@ def detect_separator_groups(
         peak_score = float(scores[peak])
         if peak_score < min_coverage:
             raise ValueError(
-                f"未在第 {boundary_index} 个五等分边界附近检测到黑色分隔线："
+                f"未在第 {boundary_index} 个等分边界附近检测到黑色分隔线："
                 f"最高覆盖率 {peak_score:.3f} < {min_coverage:.3f}。"
                 "可降低 --separator-min-coverage 或扩大 --separator-search-ratio。"
             )
@@ -149,6 +142,57 @@ def detect_separator_groups(
         if previous[1] >= current[0]:
             raise ValueError(f"检测到重叠的分隔线：{previous} 与 {current}")
     return groups
+
+
+def choose_layout(
+    rgb: np.ndarray,
+    layer_count: int,
+    black_threshold: int,
+    min_coverage: float,
+    search_ratio: float,
+) -> str:
+    """自动判定三段的排布方向。
+
+    columns = 三段横排(竖分隔线,纵向 bar 的分解图);
+    rows    = 三段竖排(横分隔线,横向 bar 的分解图)。
+    两个方向都各尝试检测一次分隔线,双双命中时取覆盖率更高的一侧。
+    """
+
+    def peak_floor(matrix: np.ndarray) -> float | None:
+        try:
+            groups = detect_separator_groups(
+                matrix, layer_count, black_threshold, min_coverage, search_ratio
+            )
+        except ValueError:
+            return None
+        scores = black_column_scores(matrix, black_threshold)
+        return min(float(scores[start:end].max()) for start, end in groups)
+
+    col_score = peak_floor(rgb)
+    row_score = peak_floor(np.transpose(rgb, (1, 0, 2)))
+    if col_score is None and row_score is None:
+        # 无分隔线的新版输出:按"等分边界带应当是纯绿(无部件跨越)"判布局
+        def boundary_green(matrix: np.ndarray) -> float:
+            width = matrix.shape[1]
+            total = 0.0
+            for k in (1, 2):
+                x = int(round(width * k / 3))
+                band = matrix[:, max(0, x - 2):x + 3].astype(np.float32)
+                dist = np.sqrt(
+                    np.sum((band - np.array([[0, 255, 0]], dtype=np.float32)) ** 2,
+                           axis=2)
+                )
+                total += float((dist < 60.0).mean())
+            return total
+
+        cols_green = boundary_green(rgb)
+        rows_green = boundary_green(np.transpose(rgb, (1, 0, 2)))
+        return "columns" if cols_green >= rows_green else "rows"
+    if row_score is None:
+        return "columns"
+    if col_score is None:
+        return "rows"
+    return "columns" if col_score >= row_score else "rows"
 
 
 def split_without_separators(
@@ -363,42 +407,6 @@ def align_linear_bar_layers(
         aligned[name] = translate_rgba(layer, dx, dy)
         shifts[name] = (dx, dy)
 
-    # 当前节点还应沿进度方向对齐填充层的开放端点。
-    fill_box = alpha_bbox(aligned["progress_fill"])
-    current_box = alpha_bbox(aligned["current_progress_indicator"])
-    if fill_box is not None and current_box is not None:
-        canvas_width, canvas_height = aligned["progress_fill"].size
-        if orientation == "vertical":
-            current_center = (current_box[1] + current_box[3]) / 2.0
-            if fill_box[1] <= canvas_height * 0.05:
-                endpoint = fill_box[3]
-            elif fill_box[3] >= canvas_height * 0.95:
-                endpoint = fill_box[1]
-            else:
-                endpoint = current_center
-            extra = int(round(endpoint - current_center))
-            if extra and abs(extra) <= canvas_height * 0.20:
-                dx, dy = shifts["current_progress_indicator"]
-                aligned["current_progress_indicator"] = translate_rgba(
-                    aligned["current_progress_indicator"], 0, extra
-                )
-                shifts["current_progress_indicator"] = (dx, dy + extra)
-        else:
-            current_center = (current_box[0] + current_box[2]) / 2.0
-            if fill_box[0] <= canvas_width * 0.05:
-                endpoint = fill_box[2]
-            elif fill_box[2] >= canvas_width * 0.95:
-                endpoint = fill_box[0]
-            else:
-                endpoint = current_center
-            extra = int(round(endpoint - current_center))
-            if extra and abs(extra) <= canvas_width * 0.20:
-                dx, dy = shifts["current_progress_indicator"]
-                aligned["current_progress_indicator"] = translate_rgba(
-                    aligned["current_progress_indicator"], extra, 0
-                )
-                shifts["current_progress_indicator"] = (dx + extra, dy)
-
     return aligned, orientation, shifts
 
 
@@ -425,9 +433,15 @@ def save_preview_on_color(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="移除五等分色键图底色、排除黑色分隔线、导出并重组图层"
+        description="移除三等分色键 bar 分解图底色、排除黑色分隔线、把 bar 拼回在一起"
     )
-    parser.add_argument("image", type=Path, help="五等分色键图片")
+    parser.add_argument("image", type=Path, help="三等分色键 bar 分解图")
+    parser.add_argument(
+        "--layout",
+        choices=("auto", "columns", "rows"),
+        default="auto",
+        help="三段排布:columns=横排(竖分隔线)、rows=竖排(横分隔线);默认自动判定",
+    )
     parser.add_argument(
         "--background",
         "--bg",
@@ -498,15 +512,35 @@ def main() -> None:
         if args.no_auto_background
         else estimate_actual_background(rgb, args.background)
     )
-    separators = detect_separator_groups(
-        rgb,
-        layer_count=len(DEFAULT_LAYER_NAMES),
-        black_threshold=args.black_threshold,
-        min_coverage=args.separator_min_coverage,
-        search_ratio=args.separator_search_ratio,
+    layout = args.layout
+    if layout == "auto":
+        layout = choose_layout(
+            rgb,
+            layer_count=len(DEFAULT_LAYER_NAMES),
+            black_threshold=args.black_threshold,
+            min_coverage=args.separator_min_coverage,
+            search_ratio=args.separator_search_ratio,
+        )
+    # rows(三段竖排)转置成 columns 复用同一套切分逻辑,最后再转置回来
+    work = source if layout == "columns" else source.transpose(
+        Image.Transpose.TRANSPOSE
     )
+    try:
+        separators = detect_separator_groups(
+            np.asarray(work, dtype=np.uint8),
+            layer_count=len(DEFAULT_LAYER_NAMES),
+            black_threshold=args.black_threshold,
+            min_coverage=args.separator_min_coverage,
+            search_ratio=args.separator_search_ratio,
+        )
+    except ValueError:
+        # 无分隔线的新版输出:按理论等分位置零宽切分
+        count = len(DEFAULT_LAYER_NAMES)
+        separators = [
+            (int(round(work.width * k / count)),) * 2 for k in range(1, count)
+        ]
     crops = split_without_separators(
-        source,
+        work,
         separators,
         layer_count=len(DEFAULT_LAYER_NAMES),
         background=actual_background,
@@ -526,6 +560,8 @@ def main() -> None:
             black_threshold=args.black_threshold,
             min_coverage=args.separator_min_coverage,
         )
+        if layout == "rows":
+            layer = layer.transpose(Image.Transpose.TRANSPOSE)
         layers[name] = layer
 
     if args.no_auto_align:
@@ -544,6 +580,8 @@ def main() -> None:
     save_preview_on_color(composite, preview_path, args.preview_background)
 
     print(f"输入尺寸: {source.width}x{source.height}")
+    print(f"三段布局: {layout}"
+          f"({'横排·竖分隔线' if layout == 'columns' else '竖排·横分隔线'})")
     print(f"指定底色: {args.background}; 实际底色估计: {actual_background}")
     print(f"检测到分隔线: {separators}")
     print(f"bar 方向: {orientation}; 自动配准位移: {shifts}")

@@ -77,7 +77,7 @@ function ImageCompareSlider({
 }
 
 /**
- * 第 15 步:前中景对比 = 第 6/8/10/11/12/14 步产物按图层序本地拼合(不上传),
+ * 第 15+ 步:前中景对比 = 第 6/8/11/12/13/15 步产物按图层序本地拼合(不上传),
  * 与原图做拖动分界线对比。
  */
 export default function CompareSliderPanel() {
@@ -100,7 +100,7 @@ export default function CompareSliderPanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              15
+              15+
             </span>
             前中景对比
           </span>

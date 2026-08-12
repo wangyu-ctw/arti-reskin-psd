@@ -6,6 +6,9 @@ export interface AnalyzedIcon {
   description: string
   positive_points: number[][]
   negative_points: number[][]
+  /** 图形本体四周是否被光影效果包裹(外发光/光晕/投影围了一圈);
+   * 为 true 时第 8 步提取同时采纳正负点,把光效切干净 */
+  has_overflow_glow?: boolean
   /** 不再由模型返回:分析完成后由前端用检测框原值回填,供下游提取使用 */
   bbox: number[]
   /** 历史字段:轮廓核对已从 Gemini 职责中移除,新分析不再返回 */
@@ -32,10 +35,13 @@ export const ICON_ANALYSIS_SCHEMA = {
           index: { type: 'integer', minimum: 0 },
           description: { type: 'string' },
           positive_points: { type: 'array', items: point, minItems: 1, maxItems: 3 },
-          // minItems 抬高到 6:模型习惯贴下限给点,3 会导致每次只有 3~4 个负点
-          negative_points: { type: 'array', items: point, minItems: 6, maxItems: 10 },
+          // minItems 抬高到 8:模型习惯贴下限给点(3→只给 3~4,6→只给 6;
+          // 加 has_overflow_glow 字段后软约束顶不住,直接抬硬下限)
+          negative_points: { type: 'array', items: point, minItems: 8, maxItems: 10 },
+          has_overflow_glow: { type: 'boolean' },
         },
-        required: ['index', 'description', 'positive_points', 'negative_points'],
+        required: ['index', 'description', 'positive_points', 'negative_points',
+                   'has_overflow_glow'],
         additionalProperties: false,
       },
     },

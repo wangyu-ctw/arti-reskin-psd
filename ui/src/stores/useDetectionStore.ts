@@ -27,9 +27,9 @@ import {
   type AnalyzedIcon,
 } from '../lib/iconAnalysis'
 import { analyzeIconGroups, type IconGroup } from '../lib/iconGroups'
-import { clampIconPoints } from '../lib/pointClamp'
-import { extractTextFront } from '../lib/textFront'
 import { analyzeCutoutFixes, fetchImageDataUrl } from '../lib/iconRefine'
+import { bboxIoU, cropBarOnGreen, cropRect, extractDecomposedLayers, generateBarDecompose, groupBars, isOverlayOnBar, listBars, probeLinesToBBoxes, unionBBoxes, type BarGroup, type BarOrientation, type DecomposeLayerName } from '../lib/barDecompose'
+import { annotateLayer, bboxToCanvas, computePanelLayers, fitToPresetCanvas, generatePanelLayer, padToCanvas, type CanvasFit } from '../lib/panelGen'
 
 export const DEFAULT_TEXT_BACK_PROMPT = stepDefaults.textBack.prompt
 
@@ -143,7 +143,6 @@ interface DetectionState {
   iconAnalysisError: string
   analyzedIcons: AnalyzedIcon[] | null
   // 域钳制结果说明(修正了几个越域点)
-  iconClampInfo: string
   // 第 8+ 步:素材化(分组 → 每组一张高清透明素材,Qwen 双图重绘)
   iconGroupModel: string
   iconGroupTemperature: number
@@ -169,10 +168,11 @@ interface DetectionState {
   // 第 7 步:提 icon(sam2 抠图)
   // 提icon源图:text_back=去字图 / origin=原图 / auto=双源逐 icon 按 SAM2 自评分择优
   iconSource: 'text_back' | 'origin' | 'auto'
-  // 第 6 步文字层:原图与去字图差值还原,生成后静默上传 pod(text_front.png)
+  // 第 6 步文字层:SAM2 按 text 框抠字(text_front_sam)+ 第 9 步同款 fill 补底(text_back_sam)
   textFrontStatus: TextBackStatus
   textFrontImageUrl: string
   textFrontError: string
+  textBackSamImageUrl: string
   iconTierParams: Record<IconTier, IconTierParams>
   iconSmallMaxSide: number
   iconLargeMinSide: number
@@ -195,11 +195,38 @@ interface DetectionState {
   iconBackStatus: TextBackStatus
   iconBackImageUrl: string
   iconBackError: string
+  // 第 9 步:提取 panel_f(前景夹层面板,SAM2 按 icon 中档参数)
+  panelFStatus: TextBackStatus
+  panelFImageUrl: string
+  panelFError: string
   // 第 9~11 步:中景层提取
   midParams: Record<MidKey, MidExtractParams>
   midStatus: Record<MidKey, TextBackStatus>
   midImageUrl: Record<MidKey, string>
   midError: Record<MidKey, string>
+  // 第 12+ 步:bar分解(三段式拆解,chroma green;先 VL 分组再逐代表分解)
+  barDecomposeModel: string
+  barDecomposeSystemPrompt: string
+  barDecomposeSystemPromptV: string
+  barDecomposeUserPrompt: string
+  barDecomposeStatus: TextBackStatus
+  barDecomposeError: string
+  barDecomposeItems: {
+    index: number
+    orientation: BarOrientation
+    url: string
+    /** 三层最小透明 PNG 的落盘文件名(空层缺席,如无 border) */
+    layers?: Partial<Record<DecomposeLayerName, string>>
+  }[]
+  // 同类 bar 分组(可选,独立触发;不归组则"全部拆解"分解所有 bar)
+  barGroupModel: string
+  barGroupSystemPrompt: string
+  barGroupUserPrompt: string
+  barGroupStatus: TextBackStatus
+  barGroupError: string
+  barGroups: BarGroup[]
+  // 正在生成中的 bar 下标(并发拆解;互不影响)
+  barDecomposeBusy: number[]
   // 第 12 步:中景层破洞图(icon_back 减去 assets/bar/button 的 mask)
   midHoleStatus: TextBackStatus
   midHoleImageUrl: string
@@ -217,6 +244,73 @@ interface DetectionState {
   midFillMaskBlur: number
   midFillMaxPixels: number
   midFillFillHoles: boolean
+  // 第 16 步:提panel(nano banana 绿底平铺生成所有 panel,静默上传 panels_green.png)
+  panelGenModel: string
+  panelGenPrompt: string
+  panelGenStatus: TextBackStatus
+  panelGenImageUrl: string
+  panelGenError: string
+  // 分层数据:每层的 panel 下标 + 每层生成图(本地 data URL)
+  panelGenLayers: number[][]
+  panelGenLayerUrls: string[]
+  // 预设画布变换(GPT 只输出预设比例,源图垫绿居中后再送)
+  panelGenCanvas: CanvasFit | null
+  // 第 17 步:panel素材(色键切割绿底平铺图,双特征匹配回原位)
+  panelAssetStatus: TextBackStatus
+  panelAssetError: string
+  panelAssetInfo: string
+  // 第 17 步 SAM2 出边参数(mask_mode=sam2 时生效)
+  panelAssetSam2: {
+    paddingRatio: number
+    minPadding: number
+    maskThreshold: number
+    featherRadius: number
+    cropScale: number
+    grow: number
+    guardGrow: number
+    refine: boolean
+    multimask: boolean
+    fillHoles: boolean
+  }
+  // 结果图缓存戳:任务完成时间,URL 带上它保证重切后必然重新拉图
+  panelAssetTick: number
+  iconAssetTick: number
+  panelAssetItems: {
+    panel_index: number
+    file: string
+    cost: number
+    uncertain: boolean
+    verify?: string
+    z?: number
+    low_res?: boolean
+    res_ratio?: number
+    paste_x: number
+    paste_y: number
+    paste_w: number
+    paste_h: number
+  }[]
+  panelAssetSourceSize: [number, number] | null
+  // 第 16 步(新):确定性提panel(SAM2 抠可见 + z 序 + 原位补洞 + 复测量)
+  panelExtractStatus: TextBackStatus
+  panelExtractError: string
+  panelExtractInfo: string
+  panelExtractTick: number
+  panelExtractItems: {
+    panel_index: number
+    file: string
+    z: number
+    filled: boolean
+    remeasured: boolean
+    hidden_ratio: number
+    needs_review: boolean
+    png_w: number
+    png_h: number
+    paste_x: number
+    paste_y: number
+    paste_w: number
+    paste_h: number
+  }[]
+  panelExtractSourceSize: [number, number] | null
   // 第 15 步:前中景对比(6/8/10/11/12/14 图层本地拼合,与原图滑杆对比,不上传)
   compareStatus: TextBackStatus
   compareImageUrl: string
@@ -252,13 +346,13 @@ interface DetectionState {
   runTextBack: () => Promise<void>
   runAnalyzeIcons: () => Promise<void>
   /** 一键清除所有负点(走"不使用负点数据"这条路) */
-  clearNegativePoints: () => void
   runAnalyzeGroups: () => Promise<void>
   runExtractIcons: () => Promise<void>
   /** 内部共用:按给定 borders 执行 SAM2 提取(提取/修正共用参数装配) */
   submitIconExtraction: (borders: Record<string, unknown>[]) => Promise<void>
   runRefineIcons: () => Promise<void>
   runIconAsset: () => Promise<void>
+  runPanelF: () => Promise<void>
   runIconBack: () => Promise<void>
   setMidParam: <K extends keyof MidExtractParams>(
     cat: MidKey,
@@ -267,10 +361,16 @@ interface DetectionState {
   ) => void
   runMidOne: (cat: MidKey) => Promise<void>
   runMidExtract: () => Promise<void>
+  runBarGrouping: () => Promise<void>
+  runBarDecompose: (only?: number[]) => Promise<void>
+  cancelBarDecompose: () => void
   runMidHole: () => Promise<void>
   runMidFill: () => Promise<void>
   runTextFront: () => Promise<void>
   runCompare: () => Promise<void>
+  runPanelGen: () => Promise<void>
+  runPanelAsset: () => Promise<void>
+  runPanelExtract: () => Promise<void>
   submit: () => Promise<void>
   cancel: () => void
   clearOutput: () => void
@@ -278,6 +378,8 @@ interface DetectionState {
 }
 
 let abortController: AbortController | null = null
+// 第 12+ 步 bar 分解的取消控制:并发批次各持一个,取消时全体中断
+const barDecomposeCtrls = new Set<AbortController>()
 
 /** 取图片自然尺寸(浏览器缓存友好,用于分档判定) */
 function loadImageSize(url: string): Promise<[number, number]> {
@@ -297,6 +399,14 @@ function analyzedToBorders(
   smallMaxSide: number,
 ): Record<string, unknown>[] {
   return analyzed.map((a) => {
+    // 带溢出光效的 icon:正负点同时采纳,负点压住框外光晕把光效切干净
+    if (a.has_overflow_glow) {
+      return {
+        bbox: a.bbox,
+        positive_points: a.positive_points,
+        negative_points: a.negative_points,
+      }
+    }
     const side = Math.max(a.bbox[2] * imgW, a.bbox[3] * imgH)
     return side <= smallMaxSide
       ? { bbox: a.bbox, positive_points: a.positive_points }
@@ -443,7 +553,6 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   iconAnalysisStatus: 'idle',
   iconAnalysisError: '',
   analyzedIcons: null,
-  iconClampInfo: '',
   iconGroupModel: stepDefaults.iconGroups.model,
   iconGroupTemperature: stepDefaults.iconGroups.temperature,
   iconGroupSystemPrompt: stepDefaults.iconGroups.systemPrompt,
@@ -457,10 +566,11 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   iconAssetItems: [],
   iconAssetSourceSize: null,
   iconAssetSummary: '',
-  iconSource: 'auto',
+  iconSource: 'text_back',
   textFrontStatus: 'idle',
   textFrontImageUrl: '',
   textFrontError: '',
+  textBackSamImageUrl: '',
   iconTierParams: {
     small: { ...stepDefaults.iconExtract.small },
     medium: { ...stepDefaults.iconExtract.medium },
@@ -485,6 +595,9 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   iconBackStatus: 'idle',
   iconBackImageUrl: '',
   iconBackError: '',
+  panelFStatus: 'idle',
+  panelFImageUrl: '',
+  panelFError: '',
   midParams: {
     assets: { ...stepDefaults.assetsExtract },
     bar: { ...stepDefaults.barExtract },
@@ -493,6 +606,20 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   midStatus: midIdle(),
   midImageUrl: midEmpty(),
   midError: midEmpty(),
+  barDecomposeModel: stepDefaults.barDecompose.model,
+  barDecomposeSystemPrompt: stepDefaults.barDecompose.systemPrompt,
+  barDecomposeSystemPromptV: stepDefaults.barDecompose.systemPromptV,
+  barDecomposeUserPrompt: stepDefaults.barDecompose.userPrompt,
+  barDecomposeStatus: 'idle',
+  barDecomposeError: '',
+  barDecomposeItems: [],
+  barGroupModel: stepDefaults.barDecompose.groupModel,
+  barGroupSystemPrompt: stepDefaults.barDecompose.groupSystemPrompt,
+  barGroupUserPrompt: stepDefaults.barDecompose.groupUserPrompt,
+  barGroupStatus: 'idle',
+  barGroupError: '',
+  barGroups: [],
+  barDecomposeBusy: [],
   midHoleStatus: 'idle',
   midHoleImageUrl: '',
   midHoleError: '',
@@ -508,6 +635,39 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   midFillMaskBlur: stepDefaults.midFill.maskBlur,
   midFillMaxPixels: stepDefaults.midFill.maxPixels,
   midFillFillHoles: stepDefaults.midFill.fillHoles,
+  panelGenModel: stepDefaults.panelGen.model,
+  panelGenPrompt: stepDefaults.panelGen.prompt,
+  panelGenStatus: 'idle',
+  panelGenImageUrl: '',
+  panelGenError: '',
+  panelGenLayers: [],
+  panelGenLayerUrls: [],
+  panelGenCanvas: null,
+  panelAssetStatus: 'idle',
+  panelAssetError: '',
+  panelAssetInfo: '',
+  panelAssetTick: 0,
+  iconAssetTick: 0,
+  panelAssetSam2: {
+    paddingRatio: 0.02,
+    minPadding: 2,
+    maskThreshold: 0.5,
+    featherRadius: 0,
+    cropScale: 1.5,
+    grow: 2,
+    guardGrow: 1,
+    refine: true,
+    multimask: false,
+    fillHoles: true,
+  },
+  panelAssetItems: [],
+  panelAssetSourceSize: null,
+  panelExtractStatus: 'idle',
+  panelExtractError: '',
+  panelExtractInfo: '',
+  panelExtractTick: 0,
+  panelExtractItems: [],
+  panelExtractSourceSize: null,
   compareStatus: 'idle',
   compareImageUrl: '',
   compareError: '',
@@ -541,7 +701,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       textBackError: '',
       iconAnalysisStatus: 'idle',
       iconAnalysisError: '',
-      analyzedIcons: null, iconClampInfo: '', iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
+      analyzedIcons: null, iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
       iconStatus: 'idle',
       iconImageUrl: '',
       iconError: '',
@@ -551,6 +711,9 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       iconBackStatus: 'idle',
       iconBackImageUrl: '',
       iconBackError: '',
+      panelFStatus: 'idle',
+      panelFImageUrl: '',
+      panelFError: '',
       midStatus: midIdle(),
       midImageUrl: midEmpty(),
       midError: midEmpty(),
@@ -560,17 +723,31 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       midFillStatus: 'idle',
       midFillImageUrl: '',
       midFillError: '',
+      barDecomposeStatus: 'idle',
+      barDecomposeError: '',
+      barDecomposeItems: [],
+      barDecomposeBusy: [],
+      barGroupStatus: 'idle',
+      barGroupError: '',
+      barGroups: [],
+      panelExtractStatus: 'idle',
+      panelExtractError: '',
+      panelExtractInfo: '',
+      panelExtractItems: [],
+      panelExtractSourceSize: null,
       compareStatus: 'idle',
       compareImageUrl: '',
       compareError: '',
       compareMissing: '',
     })
+    // 换图即换 run:12+ 步在途的并发分解请求全部中止(旧结果已无意义)
+    for (const c of barDecomposeCtrls) c.abort()
+    barDecomposeCtrls.clear()
     // 选中图片即自动上传到 RunPod,创建 run 目录
     if (file) void get().uploadOrigin()
   },
 
   restoreRun: async (runId) => {
-    // 第 6 步分析icon的结果暂不恢复(按约定略过)
     try {
       const metaResp = await fetch(`/api/runs/${encodeURIComponent(runId)}`)
       if (!metaResp.ok) return `找不到该 run(HTTP ${metaResp.status})`
@@ -601,10 +778,54 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       if (has('yolo.txt')) {
         yoloText = (await (await fetch(fileUrl('yolo.txt'))).text()).trim()
       }
+      // 第 7 步分析结果(analyzed_icons.json)
+      let restoredAnalyzed: AnalyzedIcon[] | null = null
+      if (has('analyzed_icons.json')) {
+        try {
+          restoredAnalyzed = (await (
+            await fetch(fileUrl('analyzed_icons.json'))
+          ).json()) as AnalyzedIcon[]
+        } catch {
+          restoredAnalyzed = null
+        }
+      }
+      // 第 12+ 步 bar 分解结果(bar_decompose.json)
+      let restoredBarItems: DetectionState['barDecomposeItems'] = []
+      let restoredBarGroups: BarGroup[] = []
+      if (has('bar_decompose.json')) {
+        try {
+          const meta2 = (await (
+            await fetch(fileUrl('bar_decompose.json'))
+          ).json()) as {
+            groups?: BarGroup[]
+            items?: {
+              index: number
+              orientation: BarOrientation
+              file: string
+              layers?: Partial<Record<DecomposeLayerName, string>>
+            }[]
+          }
+          restoredBarGroups = meta2.groups ?? []
+          restoredBarItems = (meta2.items ?? [])
+            .filter((it) => has(it.file))
+            .map((it) => ({
+              index: it.index,
+              orientation: it.orientation,
+              url: fileUrl(it.file),
+              layers: it.layers,
+            }))
+        } catch {
+          restoredBarItems = []
+          restoredBarGroups = []
+        }
+      }
 
       const prev = get().previewUrl
       if (prev) URL.revokeObjectURL(prev)
       get().setTextBackLocalFile(null)
+      // 切换 run:12+ 步在途的并发分解请求全部中止(旧 run 的结果已无意义)
+      for (const c of barDecomposeCtrls) c.abort()
+      barDecomposeCtrls.clear()
 
       set({
         file,
@@ -631,18 +852,30 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         textBackStatus: has('text_back.png') ? 'done' : 'idle',
         textBackImageUrl: has('text_back.png') ? fileUrl('text_back.png') : '',
         textBackError: '',
-        iconAnalysisStatus: 'idle',
+        iconAnalysisStatus: restoredAnalyzed ? 'done' : 'idle',
         iconAnalysisError: '',
-        analyzedIcons: null, iconClampInfo: '', iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
+        analyzedIcons: restoredAnalyzed,
+        barDecomposeStatus: restoredBarItems.length ? 'done' : 'idle',
+        barDecomposeError: '',
+        barDecomposeItems: restoredBarItems,
+        barGroups: restoredBarGroups,
+        barGroupStatus: restoredBarGroups.length ? 'done' : 'idle',
+        barGroupError: '',
+        barDecomposeBusy: [],
+        iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
         iconStatus: has('icons.png') ? 'done' : 'idle',
         iconImageUrl: has('icons.png') ? fileUrl('icons.png') : '',
-        textFrontStatus: has('text_front.png') ? 'done' : 'idle',
-        textFrontImageUrl: has('text_front.png') ? fileUrl('text_front.png') : '',
+        textFrontStatus: has('text_front_sam.png') ? 'done' : 'idle',
+        textFrontImageUrl: has('text_front_sam.png') ? fileUrl('text_front_sam.png') : '',
+        textBackSamImageUrl: has('text_back_sam.png') ? fileUrl('text_back_sam.png') : '',
         textFrontError: '',
         iconError: '',
         iconBackStatus: has('icon_back.png') ? 'done' : 'idle',
         iconBackImageUrl: has('icon_back.png') ? fileUrl('icon_back.png') : '',
         iconBackError: '',
+        panelFStatus: has('panel_f.png') ? 'done' : 'idle',
+        panelFImageUrl: has('panel_f.png') ? fileUrl('panel_f.png') : '',
+        panelFError: '',
         midStatus: {
           assets: has('assets.png') ? 'done' : 'idle',
           bar: has('bar.png') ? 'done' : 'idle',
@@ -659,6 +892,8 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         midHoleError: '',
         midFillStatus: has('mid_fill.png') ? 'done' : 'idle',
         midFillImageUrl: has('mid_fill.png') ? fileUrl('mid_fill.png') : '',
+        panelGenStatus: has('panels_green.png') ? 'done' : 'idle',
+        panelGenImageUrl: has('panels_green.png') ? fileUrl('panels_green.png') : '',
         midFillError: '',
         runHistory: pushRunHistory(runId),
       })
@@ -690,7 +925,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     // icon 提取仅在"从去文字图提取"模式下过期,从原图提取的结果不受影响
     set({ textBackStatus: 'running', textBackError: '',
           textFrontStatus: 'idle', textFrontImageUrl: '', textFrontError: '',
-          iconAnalysisStatus: 'idle', iconAnalysisError: '', analyzedIcons: null, iconClampInfo: '', iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
+          iconAnalysisStatus: 'idle', iconAnalysisError: '', analyzedIcons: null, iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
           iconBackStatus: 'idle', iconBackImageUrl: '', iconBackError: '',
           ...(get().iconSource === 'origin'
             ? {}
@@ -765,13 +1000,17 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         ...a,
         bbox: icons[a.index]?.bbox ?? icons[i]?.bbox ?? a.bbox,
       }))
-      // 取点域钳制:落错域的点投影回合法域(纯几何,不看图、不增删点)
-      const { icons: clamped, moved } = clampIconPoints(withBbox)
       set({
         iconAnalysisStatus: 'done',
-        analyzedIcons: clamped,
-        iconClampInfo:
-          moved > 0 ? `域钳制修正了 ${moved} 个越域点位` : '所有点位均在合法域内',
+        analyzedIcons: withBbox,
+      })
+      // 结果静默落盘 pod,恢复记录时可复用
+      fetch(`/api/runs/${runInfo.run_id}/files/analyzed_icons.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(withBbox),
+      }).catch(() => {
+        /* 静默同步,失败仅跳过 */
       })
     } catch (error) {
       if (get().runInfo?.run_id !== runInfo.run_id) return
@@ -780,15 +1019,6 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         iconAnalysisError: error instanceof Error ? error.message : '分析失败',
       })
     }
-  },
-
-  clearNegativePoints: () => {
-    const { analyzedIcons } = get()
-    if (!analyzedIcons?.length) return
-    set({
-      analyzedIcons: analyzedIcons.map((a) => ({ ...a, negative_points: [] })),
-      iconClampInfo: '已一键清除全部负点(提取将只用框+正点)',
-    })
   },
 
   runAnalyzeGroups: async () => {
@@ -1035,6 +1265,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         .join(' ')
       set({
         iconAssetStatus: 'done',
+        iconAssetTick: Date.now(),
         iconAssetSummary: `${result?.ok ?? 0}/${result?.count ?? 0} 组成功${bad ? `（${bad}）` : ''}`,
         iconAssetItems: result?.assets ?? [],
         iconAssetSourceSize: result?.source_size ?? null,
@@ -1044,6 +1275,48 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       set({
         iconAssetStatus: 'error',
         iconAssetError: error instanceof Error ? error.message : '素材化失败',
+      })
+    }
+  },
+
+  runPanelF: async () => {
+    const { runInfo, structuredResult, textBackStatus, panelFStatus, iconTierParams } = get()
+    if (!runInfo || textBackStatus !== 'done') return
+    if (panelFStatus === 'running') return
+    const borders = pickDetections(structuredResult, 'panel_f').map((d) => ({
+      bbox: d.bbox,
+    }))
+    if (borders.length === 0) return
+    // panel_f 层变了,基于它挖洞的去 icon 结果过期
+    set({ panelFStatus: 'running', panelFError: '',
+          iconBackStatus: 'idle', iconBackImageUrl: '', iconBackError: '' })
+    try {
+      // 参数复用第 8 步 icon 的中档
+      const p = iconTierParams.medium
+      const { task_id } = await submitTask('sam2', runInfo.run_id, {
+        image: 'text_back.png',
+        output: 'panel_f.png',
+        borders,
+        padding_ratio: p.paddingRatio,
+        min_padding: p.minPadding,
+        mask_threshold: p.maskThreshold,
+        feather_radius: p.featherRadius,
+        crop_scale: p.cropScale,
+        refine: p.refine,
+        multimask: p.multimask,
+        fill_holes: p.fillHoles,
+      })
+      await waitTask(task_id, { intervalMs: 2000 })
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelFStatus: 'done',
+        panelFImageUrl: `/api/runs/${runInfo.run_id}/files/panel_f.png?t=${Date.now()}`,
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelFStatus: 'error',
+        panelFError: error instanceof Error ? error.message : '提取失败',
       })
     }
   },
@@ -1071,7 +1344,11 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     try {
       const { task_id } = await submitTask('flux_fill', runInfo.run_id, {
         image: 'text_back.png',
-        mask_from: 'icons.png',
+        // panel_f 层已提取时一并挖洞(alpha 并集),夹层面板随 icon 一起移除
+        mask_from:
+          get().panelFStatus === 'done'
+            ? ['icons.png', 'panel_f.png']
+            : 'icons.png',
         hole_output: 'icon_hole.png',
         output: 'icon_back.png',
         prompt: iconBackPrompt.trim() || DEFAULT_ICON_BACK_PROMPT,
@@ -1180,10 +1457,27 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         await waitTask(holeId, { intervalMs: 1000 })
         image = holeName
       }
+      // 提bar:压在 bar 上的 icon/assets/panel 也作为独立 border 传给 SAM2
+      // (各自的框出各自的干净 mask,与 bar mask 合并),配合 restore_from
+      // 把像素从去字图还原,覆盖物随 bar 完整进入提取层
+      // panel_f 只要与 bar 有任意叠压就并入(anyOverlap),其余类走比例判定
+      const overlays =
+        cat === 'bar'
+          ? (['icon', 'assets', 'panel', 'panel_f'] as const).flatMap((k) =>
+              pickDetections(structuredResult, k).filter((d) =>
+                borders.some((b) =>
+                  isOverlayOnBar(b.bbox, d, k === 'panel_f'),
+                ),
+              ),
+            )
+          : []
       const { task_id } = await submitTask('sam2', runInfo.run_id, {
         image,
         output: `${cat}.png`,
-        borders,
+        borders: [...borders, ...overlays],
+        // 提bar:先把压在 bar 上的覆盖物从去字图还原回提取源,
+        // 再交给 SAM2 分割(不让它面对被前序挖洞破坏的残图)
+        ...(cat === 'bar' ? { restore_from: 'text_back.png' } : {}),
         padding_ratio: p.paddingRatio,
         min_padding: p.minPadding,
         mask_threshold: p.maskThreshold,
@@ -1229,6 +1523,271 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     if (pickDetections(structuredResult, 'bar').length > 0) {
       await runMidOne('bar')
     }
+  },
+
+  runBarGrouping: async () => {
+    const { runInfo, structuredResult, midStatus, apiKey } = get()
+    const bars = pickDetections(structuredResult, 'bar')
+    if (!runInfo || bars.length <= 1) return
+    if (midStatus.bar !== 'done') return // 需要第 12 步 bar.png 提取层
+    if (get().barGroupStatus === 'running') return
+    if (!apiKey.trim()) {
+      set({ barGroupStatus: 'error',
+            barGroupError: '请先在第 2 步填写 OpenRouter API Key' })
+      return
+    }
+    set({ barGroupStatus: 'running', barGroupError: '' })
+    try {
+      const base = `/api/runs/${runInfo.run_id}/files`
+      const [originDataUrl, layerDataUrl] = await Promise.all([
+        fetchImageDataUrl(`${base}/origin.png`),
+        fetchImageDataUrl(`${base}/bar.png`),
+      ])
+      const groups = await groupBars({
+        apiKey: apiKey.trim(),
+        model: get().barGroupModel.trim(),
+        temperature: stepDefaults.barDecompose.groupTemperature,
+        systemPrompt: get().barGroupSystemPrompt,
+        userPrompt: get().barGroupUserPrompt,
+        originDataUrl,
+        barLayerDataUrl: layerDataUrl,
+        bars: bars.map((b, index) => ({ index, bbox: b.bbox })),
+      })
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({ barGroupStatus: 'done', barGroups: groups })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        barGroupStatus: 'error',
+        barGroupError: error instanceof Error ? error.message : '归组失败',
+      })
+    }
+  },
+
+  runBarDecompose: async (only) => {
+    const {
+      runInfo,
+      structuredResult,
+      midStatus,
+      apiKey,
+      barDecomposeModel,
+      barDecomposeSystemPrompt,
+      barDecomposeSystemPromptV,
+      barDecomposeUserPrompt,
+    } = get()
+    const bars = pickDetections(structuredResult, 'bar')
+    if (!runInfo || bars.length === 0) return
+    if (midStatus.bar !== 'done') return // 需要第 12 步 bar.png 提取层
+    if (!apiKey.trim()) {
+      set({ barDecomposeStatus: 'error',
+            barDecomposeError: '请先在第 2 步填写 OpenRouter API Key' })
+      return
+    }
+    // 全量拆解:已归组走各组代表,未归组分解全部;单条重分解只做该条。
+    // 并发互不影响:全量在有任务跑时禁入,单条只要该条不在跑就可发
+    const busy = get().barDecomposeBusy
+    if (!only && busy.length) return
+    const groups = get().barGroups
+    const chosen = (
+      only ?? (groups.length ? groups.map((g) => g.selected)
+                             : bars.map((_, index) => index))
+    ).filter((i) => !busy.includes(i))
+    if (!chosen.length) return
+    const ctrl = new AbortController()
+    barDecomposeCtrls.add(ctrl)
+    set((s) => ({
+      barDecomposeStatus: 'running',
+      barDecomposeError: '',
+      barDecomposeBusy: [...s.barDecomposeBusy, ...chosen],
+      // 全量:清空旧结果;单条:仅摘掉被重做的那条,其余原样保留
+      barDecomposeItems: only
+        ? s.barDecomposeItems.filter((it) => !chosen.includes(it.index))
+        : [],
+    }))
+    try {
+      const base = `/api/runs/${runInfo.run_id}/files`
+      const layerDataUrl = await fetchImageDataUrl(`${base}/bar.png`)
+      const [iw, ih] = await loadImageSize(`${base}/bar.png`)
+      const tasks = listBars(bars, iw, ih).filter(
+        (t) => chosen.includes(t.index),
+      )
+      // 覆盖物随第 12 步一起提进了 bar.png,裁块用 bar∪覆盖物 的并集框,
+      // 避免突出 bar 的覆盖物(如进度头像)被裁掉;横竖判定仍用 bar 自身框
+      // panel_f 只要与 bar 有任意叠压就并入(anyOverlap),其余类走比例判定
+      const allOverlays = (['icon', 'assets', 'panel', 'panel_f'] as const).flatMap((k) =>
+        pickDetections(structuredResult, k).map((d) => ({
+          bbox: d.bbox,
+          anyOverlap: k === 'panel_f',
+        })),
+      )
+      // 逐 bar 并行分解(生成调用互不等待);出一张显示一张
+      const decomposeOne = async (t: (typeof tasks)[number]) => {
+        const onBar = allOverlays.filter((d) =>
+          isOverlayOnBar(t.bbox, d, d.anyOverlap),
+        )
+        const cropBbox = unionBBoxes([t.bbox, ...onBar.map((d) => d.bbox)])
+        const { url: barDataUrl } = await cropBarOnGreen(layerDataUrl, cropBbox)
+        // 二次 YOLO 探测:整图检测常漏掉 bar 上的小覆盖物(里程碑槽等),
+        // 对放大的 bar 裁块单独跑一遍,检出的并入抹绿名单(IoU 去重)。
+        // (后端任务队列是 FIFO 单工位,并行提交会自动排队,无碍)
+        let probeBoxes: number[][] = []
+        try {
+          const probeName = `_bar_probe_${t.index}.png`
+          const blob = await (await fetch(barDataUrl)).blob()
+          await fetch(`${base}/${probeName}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'image/png' },
+            body: blob,
+          })
+          const probeTask = await submitTask('yolo', runInfo.run_id, {
+            image: probeName,
+            txt_output: `_bar_probe_${t.index}.txt`,
+          })
+          const probeRes = (await waitTask(probeTask.task_id)) as {
+            lines?: string[]
+          }
+          const rect = cropRect(cropBbox, iw, ih)
+          probeBoxes = probeLinesToBBoxes(probeRes?.lines ?? [], rect, iw, ih)
+            .filter((b) => isOverlayOnBar(t.bbox, { bbox: b }))
+            .filter((b) =>
+              onBar.every((d) => bboxIoU(b, d.bbox) < 0.5),
+            )
+        } catch {
+          /* 探测失败不阻断,退回结构检测的覆盖物 */
+        }
+        if (ctrl.signal.aborted) throw new DOMException('aborted', 'AbortError')
+        const eraseBoxes = [...onBar.map((d) => d.bbox), ...probeBoxes]
+        // 轨道图:检测框抹绿 + 几何鼓包兜底 + 两侧截面拉伸机械桥接,
+        // 得到连续直线轨道;一处都没抹到的 bar 退回原裁块
+        const track = await cropBarOnGreen(layerDataUrl, cropBbox, 0.06,
+                                           eraseBoxes, t.orientation)
+        const trackDataUrl = track.erased > 0 ? track.url : undefined
+        const url = await generateBarDecompose({
+          apiKey: apiKey.trim(),
+          model: barDecomposeModel.trim(),
+          // 横向 bar → 三段竖排;纵向 bar → 三段横排
+          systemPrompt: t.orientation === 'horizontal'
+            ? barDecomposeSystemPromptV
+            : barDecomposeSystemPrompt,
+          userPrompt: barDecomposeUserPrompt,
+          barDataUrl,
+          trackDataUrl,
+          orientation: t.orientation,
+          signal: ctrl.signal,
+        })
+        if (get().runInfo?.run_id !== runInfo.run_id) return
+        // functional set:与其它并发中的分解互不覆盖
+        set((s) => ({
+          barDecomposeItems: [
+            ...s.barDecomposeItems.filter((it) => it.index !== t.index),
+            { index: t.index, orientation: t.orientation, url },
+          ].sort((a, b) => a.index - b.index),
+        }))
+        // 静默上传 pod
+        try {
+          const blob = await (await fetch(url)).blob()
+          await fetch(`${base}/bar_decompose_${t.index}.png`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'image/png' },
+            body: blob,
+          })
+        } catch {
+          /* 静默上传,失败仅跳过 */
+        }
+        // 三层各自按 alpha 包围盒紧裁成最小透明 PNG 落盘;
+        // 空层(如没有 border)不生成对应文件
+        try {
+          const layerPngs = await extractDecomposedLayers(url, t.orientation)
+          const layerFiles: Partial<Record<DecomposeLayerName, string>> = {}
+          for (const L of layerPngs) {
+            const fname = `bar_${t.index}_${L.name}.png`
+            const blob = await (await fetch(L.dataUrl)).blob()
+            await fetch(`${base}/${fname}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'image/png' },
+              body: blob,
+            })
+            layerFiles[L.name] = fname
+          }
+          if (get().runInfo?.run_id !== runInfo.run_id) return
+          set((s) => ({
+            barDecomposeItems: s.barDecomposeItems.map((it) =>
+              it.index === t.index ? { ...it, layers: layerFiles } : it,
+            ),
+          }))
+        } catch {
+          /* 逐层落盘失败不阻断主结果 */
+        }
+      }
+      const settled = await Promise.allSettled(tasks.map(decomposeOne))
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      const failed = settled.filter(
+        (s): s is PromiseRejectedResult => s.status === 'rejected',
+      )
+      if (failed.length && !ctrl.signal.aborted) {
+        // 部分失败:保留已完成的,报出第一个错误
+        throw failed[0].reason
+      }
+      // 本批收尾:摘掉自己的 busy 下标;没有其它并发批次时才定全局状态
+      set((s) => {
+        const nextBusy = s.barDecomposeBusy.filter((i) => !chosen.includes(i))
+        return {
+          barDecomposeBusy: nextBusy,
+          ...(nextBusy.length
+            ? {}
+            : { barDecomposeStatus: s.barDecomposeItems.length ? 'done' : 'idle' }),
+        }
+      })
+      // 元数据落盘(图片已逐张上传),恢复记录时可复用
+      fetch(`${base}/bar_decompose.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          groups: get().barGroups,
+          items: get().barDecomposeItems.map((it) => ({
+            index: it.index,
+            orientation: it.orientation,
+            file: `bar_decompose_${it.index}.png`,
+            layers: it.layers ?? {},
+          })),
+        }),
+      }).catch(() => {
+        /* 静默同步,失败仅跳过 */
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      const aborted = ctrl.signal.aborted
+      set((s) => {
+        const nextBusy = s.barDecomposeBusy.filter((i) => !chosen.includes(i))
+        if (aborted) {
+          // 用户取消:保留已完成的图,不算错误
+          return {
+            barDecomposeBusy: nextBusy,
+            ...(nextBusy.length
+              ? {}
+              : { barDecomposeStatus: s.barDecomposeItems.length ? 'done' : 'idle' }),
+          }
+        }
+        return {
+          barDecomposeBusy: nextBusy,
+          barDecomposeStatus: 'error',
+          barDecomposeError:
+            error instanceof Error ? error.message : '分解失败',
+        }
+      })
+    } finally {
+      barDecomposeCtrls.delete(ctrl)
+    }
+  },
+
+  cancelBarDecompose: () => {
+    // 全体中断:砍掉所有并发批次的在途请求,留下已完成的项
+    for (const c of barDecomposeCtrls) c.abort()
+    barDecomposeCtrls.clear()
+    set((s) => ({
+      barDecomposeBusy: [],
+      barDecomposeStatus: s.barDecomposeItems.length ? 'done' : 'idle',
+    }))
   },
 
   runMidHole: async () => {
@@ -1277,10 +1836,11 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     set({ midFillStatus: 'running', midFillError: '' })
     try {
       // 修补第 12 步破洞图:底图用 icon_back(洞外像素一致且全不透明),
-      // 修补区取 mid_hole.png 的透明区;默认挂 icon_back_fill LoRA
+      // 修补区取 mid_hole.png 的透明区;挂 mid_fill 专项 LoRA(2026-08-10 训)
       const { task_id } = await submitTask('flux_fill', runInfo.run_id, {
         image: 'icon_back.png',
         mask_from_holes: 'mid_hole.png',
+        lora: 'mid_fill.safetensors',
         output: 'mid_fill.png',
         prompt: midFillPrompt.trim() || DEFAULT_MID_FILL_PROMPT,
         seed: midFillSeed,
@@ -1307,32 +1867,250 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   },
 
   runTextFront: async () => {
-    const { runInfo, textBackStatus, textFrontStatus, textBackImageUrl } = get()
-    if (!runInfo || textBackStatus !== 'done') return
+    const {
+      runInfo,
+      structuredResult,
+      textFrontStatus,
+      iconTierParams,
+      iconBackPrompt,
+      iconBackSeed,
+      iconBackSteps,
+      iconBackGuidance,
+      iconBackGrowMask,
+      iconBackMaskBlur,
+      iconBackMaxPixels,
+      iconBackFillHoles,
+    } = get()
+    const texts = pickDetections(structuredResult, 'text')
+    if (!runInfo || texts.length === 0) return
     if (textFrontStatus === 'running') return
-    set({ textFrontStatus: 'running', textFrontError: '' })
+    set({ textFrontStatus: 'running', textFrontError: '',
+          textBackSamImageUrl: '' })
     try {
       const base = `/api/runs/${runInfo.run_id}/files`
-      // 原图恒取 pod(本地 previewUrl 可能已被释放);去字图优先当前展示的那份
-      const blob = await extractTextFront(
-        `${base}/origin.png`,
-        textBackImageUrl || `${base}/text_back.png`,
-      )
-      const put = await fetch(`${base}/text_front.png`, {
-        method: 'POST',
-        body: blob,
+      // ① SAM2 按 text 框抠文字层(配置随第 8 步"小图标"档)
+      const small = iconTierParams.small
+      const samTask = await submitTask('sam2', runInfo.run_id, {
+        image: 'origin.png',
+        output: 'text_front_sam.png',
+        borders: texts.map((t) => ({ bbox: t.bbox })),
+        padding_ratio: small.paddingRatio,
+        min_padding: small.minPadding,
+        mask_threshold: small.maskThreshold,
+        feather_radius: small.featherRadius,
+        crop_scale: small.cropScale,
+        refine: small.refine,
+        multimask: small.multimask,
+        fill_holes: small.fillHoles,
       })
-      if (!put.ok) throw new Error(`上传失败:HTTP ${put.status}`)
+      await waitTask(samTask.task_id, { intervalMs: 2000 })
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        textFrontImageUrl: `${base}/text_front_sam.png?t=${Date.now()}`,
+      })
+      // ② 第 9 步同款 flux_fill(icon_back LoRA)修补抠字后的洞
+      const fillTask = await submitTask('flux_fill', runInfo.run_id, {
+        image: 'origin.png',
+        mask_from: 'text_front_sam.png',
+        output: 'text_back_sam.png',
+        prompt: iconBackPrompt.trim() || DEFAULT_ICON_BACK_PROMPT,
+        seed: iconBackSeed,
+        steps: iconBackSteps,
+        guidance: iconBackGuidance,
+        grow_mask: iconBackGrowMask,
+        mask_blur: iconBackMaskBlur,
+        max_pixels: iconBackMaxPixels,
+        fill_holes: iconBackFillHoles,
+      })
+      await waitTask(fillTask.task_id, { intervalMs: 2000 })
       if (get().runInfo?.run_id !== runInfo.run_id) return
       set({
         textFrontStatus: 'done',
-        textFrontImageUrl: `${base}/text_front.png?t=${Date.now()}`,
+        textBackSamImageUrl: `${base}/text_back_sam.png?t=${Date.now()}`,
       })
     } catch (error) {
       if (get().runInfo?.run_id !== runInfo.run_id) return
       set({
         textFrontStatus: 'error',
         textFrontError: error instanceof Error ? error.message : '生成失败',
+      })
+    }
+  },
+
+  runPanelAsset: async () => {
+    const { runInfo, structuredResult, panelGenStatus, panelAssetStatus } = get()
+    const panels = pickDetections(structuredResult, 'panel')
+    if (!runInfo || panelGenStatus !== 'done' || panels.length === 0) return
+    if (panelAssetStatus === 'running') return
+    set({ panelAssetStatus: 'running', panelAssetError: '', panelAssetInfo: '' })
+    try {
+      const task = await submitTask('panel_asset', runInfo.run_id, {
+        panels: panels.map((p) => p.bbox),
+        ...(get().panelGenLayers.length
+          ? { layers: get().panelGenLayers,
+              canvas: get().panelGenCanvas }
+          : {}),
+      })
+      const result = (await waitTask(task.task_id)) as {
+        count_panels?: number
+        count_tiles?: number
+        count_ok?: boolean
+        assets?: DetectionState['panelAssetItems']
+        source_size?: [number, number]
+      }
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      const uncertain = (result?.assets ?? []).filter((a) => a.uncertain)
+      set({
+        panelAssetStatus: 'done',
+        panelAssetTick: Date.now(),
+        panelAssetItems: result?.assets ?? [],
+        panelAssetSourceSize: result?.source_size ?? null,
+        panelAssetInfo:
+          `切出 ${result?.count_tiles ?? 0} 块 / 检测 ${result?.count_panels ?? 0} 个` +
+          (result?.count_ok ? '（数量一致）' : '（数量不符,谨慎使用!）') +
+          (uncertain.length
+            ? `；低置信匹配:#${uncertain.map((u) => u.panel_index).join(' #')}`
+            : '') +
+          ((result?.assets ?? []).some((a) => a.low_res)
+            ? `；分辨率不足(画小了,拉回会糊):#${(result?.assets ?? [])
+                .filter((a) => a.low_res)
+                .map((a) => `${a.panel_index}(×${a.res_ratio})`)
+                .join(' #')}`
+            : ''),
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelAssetStatus: 'error',
+        panelAssetError: error instanceof Error ? error.message : '切割匹配失败',
+      })
+    }
+  },
+
+  runPanelExtract: async () => {
+    const { runInfo, structuredResult, midFillStatus, panelExtractStatus } = get()
+    const panels = pickDetections(structuredResult, 'panel')
+    if (!runInfo || midFillStatus !== 'done' || panels.length === 0) return
+    if (panelExtractStatus === 'running') return
+    set({ panelExtractStatus: 'running', panelExtractError: '', panelExtractInfo: '' })
+    try {
+      const task = await submitTask('panel_extract', runInfo.run_id, {
+        panels: panels.map((p) => p.bbox),
+      })
+      const result = (await waitTask(task.task_id)) as {
+        count?: number
+        ok?: number
+        filled_count?: number
+        assets?: DetectionState['panelExtractItems']
+        source_size?: [number, number]
+        elapsed_sec?: number
+      }
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      const items = result?.assets ?? []
+      const review = items.filter((a) => a.needs_review)
+      set({
+        panelExtractStatus: 'done',
+        panelExtractTick: Date.now(),
+        panelExtractItems: items,
+        panelExtractSourceSize: result?.source_size ?? null,
+        panelExtractInfo:
+          `提出 ${result?.ok ?? 0} / ${result?.count ?? 0} 个,` +
+          `补洞 ${result?.filled_count ?? 0} 个,耗时 ${result?.elapsed_sec ?? '?'}s` +
+          (review.length
+            ? `；建议人工复核(隐藏占比>60%):#${review.map((a) => a.panel_index).join(' #')}`
+            : ''),
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelExtractStatus: 'error',
+        panelExtractError: error instanceof Error ? error.message : '提取失败',
+      })
+    }
+  },
+
+  runPanelGen: async () => {
+    const {
+      runInfo,
+      structuredResult,
+      midFillStatus,
+      apiKey,
+      panelGenStatus,
+      panelGenModel,
+      panelGenPrompt,
+    } = get()
+    const panels = pickDetections(structuredResult, 'panel')
+    if (!runInfo || midFillStatus !== 'done' || panels.length === 0) return
+    if (panelGenStatus === 'running') return
+    if (!apiKey.trim()) {
+      set({ panelGenStatus: 'error',
+            panelGenError: '请先在第 2 步填写 OpenRouter API Key' })
+      return
+    }
+    set({ panelGenStatus: 'running', panelGenError: '',
+          panelGenLayers: [], panelGenLayerUrls: [] })
+    try {
+      const midFillDataUrl = await fetchImageDataUrl(
+        `/api/runs/${runInfo.run_id}/files/mid_fill.png`,
+      )
+      const [imgW, imgH] = await loadImageSize(
+        `/api/runs/${runInfo.run_id}/files/mid_fill.png`,
+      )
+      // 最少无重叠分层(贪心着色),逐层"原位保留+剥离"生成
+      const layers = computePanelLayers(panels, [imgW, imgH])
+      // GPT 只输出预设画布比例:源图等比垫绿到最近预设,坐标全程带变换,
+      // 否则输出会被强行拉伸回源比例,素材全部变形(实测教训)
+      const fit = fitToPresetCanvas(imgW, imgH)
+      const paddedMidFill = await padToCanvas(midFillDataUrl, fit)
+      const toCanvas = (b: number[]) => bboxToCanvas(b, imgW, imgH, fit)
+      const layerUrls: string[] = []
+      for (let k = 0; k < layers.length; k++) {
+        const keepIdx = new Set(layers[k])
+        const keepBoxes = layers[k].map((i) => toCanvas(panels[i].bbox))
+        const stripBoxes = panels
+          .filter((_, i) => !keepIdx.has(i))
+          .map((p) => toCanvas(p.bbox))
+        const annotatedDataUrl = await annotateLayer(
+          paddedMidFill, keepBoxes, stripBoxes,
+        )
+        const url = await generatePanelLayer({
+          apiKey: apiKey.trim(),
+          model: panelGenModel.trim(),
+          prompt: panelGenPrompt,
+          midFillDataUrl: paddedMidFill,
+          annotatedDataUrl,
+          keep: layers[k].map((i) => ({ index: i, bbox: toCanvas(panels[i].bbox) })),
+          stripCount: stripBoxes.length,
+          layerNo: k + 1,
+          layerTotal: layers.length,
+        })
+        layerUrls.push(url)
+        // 逐层即时可见
+        if (get().runInfo?.run_id !== runInfo.run_id) return
+        set({ panelGenLayers: layers.slice(0, k + 1),
+              panelGenLayerUrls: [...layerUrls] })
+        // 静默上传 pod:panels_green_L<k>.png
+        try {
+          const blob = await (await fetch(url)).blob()
+          await fetch(
+            `/api/runs/${runInfo.run_id}/files/panels_green_L${k}.png`,
+            { method: 'POST', headers: { 'Content-Type': 'image/png' },
+              body: blob },
+          )
+        } catch {
+          /* 静默上传,失败仅跳过 */
+        }
+      }
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({ panelGenStatus: 'done', panelGenLayers: layers,
+            panelGenLayerUrls: layerUrls,
+            panelGenCanvas: fit,
+            panelGenImageUrl: layerUrls[0] ?? '' })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelGenStatus: 'error',
+        panelGenError: error instanceof Error ? error.message : '生成失败',
       })
     }
   },
@@ -1366,7 +2144,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         ['button.png', '11提button'],
         ['assets.png', '10提assets'],
         ['icons.png', '8提icon'],
-        // ['text_front.png', '6文字层'],
+        // ['text_front_sam.png', '6文字层'],
       ] as const
       const missing: string[] = []
       let drawn = 0

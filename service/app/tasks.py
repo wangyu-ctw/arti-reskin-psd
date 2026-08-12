@@ -500,16 +500,22 @@ def _build_fill_mask(run_dir: Path, payload: dict, size: tuple) -> Image.Image:
             alpha = m.getchannel("A").resize(size, Image.Resampling.BILINEAR)
         mask = alpha.point(lambda a: 255 if a < 128 else 0)
     else:
+        # mask_from 支持单文件名或数组:数组时逐层取 alpha 并集
+        # (如第 9 步 icons.png + panel_f.png 一起挖洞)
         mask_from = payload.get("mask_from") or "icons.png"
-        src = run_dir / mask_from
-        if not src.is_file():
-            raise FileNotFoundError(f"mask_from file not found: {src}")
-        with Image.open(src) as m:
-            if "A" not in m.getbands():
-                raise ValueError(f"{mask_from} has no alpha channel, "
-                                 "pass an explicit grayscale mask via payload.mask")
-            alpha = m.getchannel("A").resize(size, Image.Resampling.BILINEAR)
-        mask = alpha.point(lambda a: 255 if a > 0 else 0)
+        names = mask_from if isinstance(mask_from, list) else [mask_from]
+        mask = None
+        for name in names:
+            src = run_dir / name
+            if not src.is_file():
+                raise FileNotFoundError(f"mask_from file not found: {src}")
+            with Image.open(src) as m:
+                if "A" not in m.getbands():
+                    raise ValueError(f"{name} has no alpha channel, "
+                                     "pass an explicit grayscale mask via payload.mask")
+                alpha = m.getchannel("A").resize(size, Image.Resampling.BILINEAR)
+            layer = alpha.point(lambda a: 255 if a > 0 else 0)
+            mask = layer if mask is None else ImageChops.lighter(mask, layer)
 
     # 先封孔再外扩:内部针孔并入重绘区,避免 icon 残片留给 Fill 模型
     if payload.get("fill_holes", True):
@@ -557,7 +563,8 @@ def handle_flux_fill(payload: dict) -> dict:
     payload:
         run_id / dir     图片所在目录(二选一)
         image            输入图片名,默认 text_back.png
-        mask_from        默认 icons.png,取其 alpha>0 的区域作为修补区
+        mask_from        默认 icons.png,取其 alpha>0 的区域作为修补区;
+                         可传数组(如 ["icons.png","panel_f.png"]),逐层 alpha 并集
         mask_from_holes  取指定图片的透明区(alpha≈0)为修补区,如 mid_hole.png 的破洞
         mask             或直接指定灰度 mask 图片名(白=修补),优先级最高
         output           输出图片名,默认 inpainted.png
@@ -649,11 +656,22 @@ def _write_hole_image(run_dir: Path, payload: dict, origin: Path) -> Path:
         with Image.open(run_dir / payload["mask"]) as m:
             region = m.convert("L").point(lambda v: 255 if v > 127 else 0)
     else:
+        # 与 _build_mask 同口径:mask_from 支持单文件名或数组(alpha 并集)
         mask_from = payload.get("mask_from") or "icons.png"
-        with Image.open(run_dir / mask_from) as m:
-            if "A" not in m.getbands():
-                raise ValueError(f"{mask_from} has no alpha channel")
-            region = m.getchannel("A").point(lambda a: 255 if a > 0 else 0)
+        names = mask_from if isinstance(mask_from, list) else [mask_from]
+        region = None
+        for name in names:
+            with Image.open(run_dir / name) as m:
+                if "A" not in m.getbands():
+                    raise ValueError(f"{name} has no alpha channel")
+                layer = m.getchannel("A").point(lambda a: 255 if a > 0 else 0)
+            if region is None:
+                region = layer
+            elif layer.size != region.size:
+                region = ImageChops.lighter(
+                    region, layer.resize(region.size, Image.Resampling.NEAREST))
+            else:
+                region = ImageChops.lighter(region, layer)
 
     with Image.open(origin) as img:
         base = img.convert("RGBA")
@@ -750,7 +768,8 @@ def handle_yolo(payload: dict) -> dict:
                          紧致外接框替换 YOLO 框,治"检测框小了一截"的系统性偏差
         refine_classes   默认 [1,2,3,4](icon/assets/button/bar);text 不回投
                          (字形稀疏 mask 会把行框改小),panel 不回投(大框风险高)
-    结果同时写 <run_dir>/yolo.txt 留档。
+        txt_output       留档文件名,默认 yolo.txt;探测类调用传独立名避免覆盖存档
+    结果同时写 <run_dir>/<txt_output> 留档。
     """
     if payload.get("dir"):
         run_dir = Path(payload["dir"])
@@ -794,7 +813,9 @@ def handle_yolo(payload: dict) -> dict:
             result["lines"] = lines
             result["bbox_refined"] = n_refined
 
-    txt_path = run_dir / "yolo.txt"
+    # txt_output:探测类调用(如 12+ bar 裁块二次检测)传入独立文件名,
+    # 避免覆盖 run 的 yolo.txt 检测存档
+    txt_path = run_dir / (payload.get("txt_output") or "yolo.txt")
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     result["txt_path"] = str(txt_path)
     result["elapsed_sec"] = round(time.time() - started, 1)
@@ -821,6 +842,11 @@ def handle_sam2(payload: dict) -> dict:
         alt_image          可选备选源图名(如 origin.png)。提供后 border 可带
                            source 字段:primary/alt/auto(auto=双源按 SAM2 自评分择优);
                            结果的 sources 字段记录逐 border 择源情况
+        restore_from       可选源图名(如 text_back.png):提取前在每个 border 框
+                           邻域内把该图像素贴回提取源,恢复被前序挖洞破坏的自然
+                           外观(串行提 bar 时,压在 bar 上的 icon/assets/panel
+                           还原回去再分割,SAM2 不再面对黑洞残图)
+        restore_margin_ratio  默认 0.08,还原区按框长边比例外扩
     """
     if payload.get("dir"):
         run_dir = Path(payload["dir"])
@@ -837,6 +863,32 @@ def handle_sam2(payload: dict) -> dict:
         raise FileNotFoundError(f"alt image not found: {run_dir / alt_image}")
 
     started = time.time()
+    restore_from = payload.get("restore_from")
+    restore_tmp = None
+    if restore_from:
+        rf_path = run_dir / restore_from
+        if not rf_path.is_file():
+            raise FileNotFoundError(f"restore_from not found: {rf_path}")
+        with Image.open(run_dir / image) as im:
+            base_img = im.convert("RGB")
+        with Image.open(rf_path) as im:
+            rest = im.convert("RGB")
+        if rest.size != base_img.size:
+            rest = rest.resize(base_img.size, Image.Resampling.LANCZOS)
+        bw_, bh_ = base_img.size
+        mr = float(payload.get("restore_margin_ratio", 0.08))
+        for b in borders:
+            cx, cy, w, h = (float(v) for v in b["bbox"][:4])
+            mm = max(4, round(max(w * bw_, h * bh_) * mr))
+            rx0 = max(0, int((cx - w / 2) * bw_) - mm)
+            ry0 = max(0, int((cy - h / 2) * bh_) - mm)
+            rx1 = min(bw_, int(math.ceil((cx + w / 2) * bw_)) + mm)
+            ry1 = min(bh_, int(math.ceil((cy + h / 2) * bh_)) + mm)
+            base_img.paste(rest.crop((rx0, ry0, rx1, ry1)), (rx0, ry0))
+        restore_tmp = "_sam2_restore_src.png"
+        base_img.save(run_dir / restore_tmp)
+        image = restore_tmp
+
     result = sam2c.cutout({
         "dir": str(run_dir),
         "image": image,
@@ -853,6 +905,9 @@ def handle_sam2(payload: dict) -> dict:
         "fill_holes": payload.get("fill_holes", True),
         "size_rules": payload.get("size_rules") or [],
     })
+    if restore_tmp:
+        (run_dir / restore_tmp).unlink(missing_ok=True)
+        result["restored_from"] = restore_from
     result["elapsed_sec"] = round(time.time() - started, 1)
     return result
 
@@ -1242,7 +1297,8 @@ def _border_median_color(rgb: Image.Image) -> tuple:
 
 
 def _unkey_border(img: Image.Image, tol: int = 60,
-                  defringe: int = 1) -> Image.Image:
+                  defringe: int = 1, key: tuple = None,
+                  junk: bool = True) -> Image.Image:
     """全局色键去底(底色自适应):
     1. 以"边框中位色"为键色(Qwen 会把底色画跑偏,以实际输出为准),
        全图凡接近键色的一律透明——底色本就按"离图标调色板最远"自适应挑选,
@@ -1251,11 +1307,18 @@ def _unkey_border(img: Image.Image, tol: int = 60,
        真图标居中且有 pad 不会贴边;若清完全空则回退不清;
     3. alpha 收缩 defringe 像素,消掉边缘 1px 混色晕。"""
     rgb = img.convert("RGB")
-    key = _border_median_color(rgb)
+    if key is None:
+        key = _border_median_color(rgb)
     diff = ImageChops.difference(rgb, Image.new("RGB", rgb.size, key))
     # 每通道差值取最大近似色距;point 后 0=接近底色,255=图标内容
     r, g, b = diff.split()
     dist = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    # 软阈值 alpha:tol*0.7 ~ tol*1.3 线性过渡——抗锯齿边缘拿到渐变透明度,
+    # 不再"非0即255"地留绿毛刺或啃出锯齿
+    lo, hi = tol * 0.7, tol * 1.3
+    ramp = [0 if v <= lo else 255 if v >= hi
+            else int((v - lo) / (hi - lo) * 255) for v in range(256)]
+    alpha_soft = dist.point(ramp).convert("L")
     binary = dist.point(lambda v: 0 if v <= tol else 255).convert("L")
     # 色相键补刀:模型常拿底色画投影/描边(同色相但明暗不同,RGB 距离抓不住),
     # 与键色同色相且饱和度高的一律并入底色。底色是按"远离图标调色板"自适应
@@ -1274,19 +1337,45 @@ def _unkey_border(img: Image.Image, tol: int = 60,
     w, h = binary.size
     border = ([(x, y) for x in range(w) for y in (0, h - 1)]
               + [(x, y) for y in range(h) for x in (0, w - 1)])
-    # 贴边的"内容"残留染 64(候删)
-    for x, y in border:
-        if binary.getpixel((x, y)) == 255:
-            ImageDraw.floodfill(binary, (x, y), 64)
+    # 贴边的"内容"残留染 64(候删);junk=False 时跳过(槽位直裁场景
+    # 素材本来就可能贴着裁剪框)
+    if junk:
+        for x, y in border:
+            if binary.getpixel((x, y)) == 255:
+                ImageDraw.floodfill(binary, (x, y), 64)
     hist = binary.histogram()
     junk_ok = hist[255] > w * h * 0.005  # 清完还有足量内容才生效
-    alpha = binary.point(
-        lambda v: 255 if (v == 255 or (not junk_ok and v == 64)) else 0)
+    # 硬判定得到的"删除区"(底色/色相键命中/贴边残留)在软 alpha 上清零,
+    # 其余位置保留软 alpha 的渐变边缘
+    removed = binary.point(
+        lambda v: 0 if (v == 255 or (not junk_ok and v == 64)) else 255)
+    alpha = ImageChops.subtract(alpha_soft, removed.convert("L"))
     if defringe > 0:
         alpha = alpha.filter(ImageFilter.MinFilter(2 * defringe + 1))
-    out = rgb.convert("RGBA")
+
+    out = _despill_edges(rgb, alpha, key).convert("RGBA")
     out.putalpha(alpha)
     return out
+
+
+def _despill_edges(rgb: Image.Image, alpha: Image.Image, key: tuple) -> Image.Image:
+    """边缘退底色(despill):只在 alpha 过渡带内压掉渗入的键色,
+    带外原样保留,不误伤与底色同色系的图形本体。"""
+    band = alpha.point(lambda v: 255 if 0 < v < 255 else 0)
+    band = band.filter(ImageFilter.MaxFilter(3))
+    r0, g0, b0 = rgb.split()
+    kr, kg, kb = key
+    if kg >= kr and kg >= kb:
+        # 绿键:G 超出 max(R,B) 的部分视为绿溢出,压平
+        despilled = Image.merge(
+            "RGB", (r0, ImageChops.darker(g0, ImageChops.lighter(r0, b0)), b0))
+    else:
+        # 品红键:min(R,B) 超出 G 的部分视为品红溢出,从 R、B 同时扣除
+        excess = ImageChops.subtract(ImageChops.darker(r0, b0), g0)
+        despilled = Image.merge(
+            "RGB", (ImageChops.subtract(r0, excess), g0,
+                    ImageChops.subtract(b0, excess)))
+    return Image.composite(despilled, rgb, band)
 
 
 def handle_icon_asset(payload: dict) -> dict:
@@ -1508,6 +1597,995 @@ def handle_icon_asset(payload: dict) -> dict:
     }
 
 
+def _connected_tiles(rgba: Image.Image, min_area_ratio: float = 0.0005):
+    """绿底切割后的连通域分析:返回每个素材块的全分辨率紧致框列表。
+
+    在 ≤512px 的缩略 alpha 上做 floodfill 标记(纯 PIL,C 实现,快),
+    再映射回全分辨率并按 alpha 收紧。
+    """
+    w, h = rgba.size
+    scale = min(1.0, 512 / max(w, h))
+    sw_, sh_ = max(1, round(w * scale)), max(1, round(h * scale))
+    small = rgba.getchannel("A").resize((sw_, sh_), Image.Resampling.NEAREST)
+    binary = small.point(lambda v: 255 if v > 0 else 0)
+    px = binary.load()
+    label = 1
+    for y in range(sh_):
+        for x in range(sw_):
+            if px[x, y] == 255 and label < 250:
+                ImageDraw.floodfill(binary, (x, y), label)
+                label += 1
+    boxes = {}
+    areas = {}
+    for y in range(sh_):
+        for x in range(sw_):
+            v = px[x, y]
+            if 0 < v < 255:
+                b = boxes.get(v)
+                if b is None:
+                    boxes[v] = [x, y, x, y]
+                else:
+                    b[0], b[1] = min(b[0], x), min(b[1], y)
+                    b[2], b[3] = max(b[2], x), max(b[3], y)
+                areas[v] = areas.get(v, 0) + 1
+    tiles = []
+    alpha = rgba.getchannel("A")
+    for v, (x0, y0, x1, y1) in boxes.items():
+        if areas[v] < sw_ * sh_ * min_area_ratio:
+            continue  # 噪点碎屑
+        # 映射回全分辨率,外扩 2 个缩略像素再按 alpha 收紧
+        pad = 2
+        fx0 = max(0, int((x0 - pad) / scale))
+        fy0 = max(0, int((y0 - pad) / scale))
+        fx1 = min(w, int(math.ceil((x1 + 1 + pad) / scale)))
+        fy1 = min(h, int(math.ceil((y1 + 1 + pad) / scale)))
+        tight = alpha.crop((fx0, fy0, fx1, fy1)).getbbox()
+        if not tight:
+            continue
+        tiles.append((fx0 + tight[0], fy0 + tight[1],
+                      fx0 + tight[2], fy0 + tight[3]))
+    return tiles
+
+
+def _thumb_vec(img: Image.Image, size: int = 16):
+    """16×16 RGB 色彩网格向量(RGBA 先合成到中性灰上)。"""
+    if img.mode == "RGBA":
+        base = Image.new("RGB", img.size, (128, 128, 128))
+        base.paste(img, (0, 0), img)
+        img = base
+    return list(img.convert("RGB").resize((size, size)).getdata())
+
+
+def _vec_dist(a, b) -> float:
+    """平均每通道绝对差,归一到 0~1。"""
+    total = sum(abs(pa[c] - pb[c]) for pa, pb in zip(a, b) for c in range(3))
+    return total / (len(a) * 3 * 255)
+
+
+def _panel_z_order(panel_rects, tiles_by_panel, src: Image.Image):
+    """计算 panel 前后叠放次序(z 越大越靠上)。
+
+    规则:
+    1. 一个 panel 的边界完全在另一个里面 → 内者在上;
+    2. 部分重合 → 取色裁决:取源图重叠区像素,分别与两个候选素材在
+       该区域的对应画面比色,谁更像谁在上(重叠区显示的是上层的像素)。
+    以两两裁决建有向边(下→上),Kahn 拓扑排序出 z;有环时按面积降序兜底
+    (大的一般在下)。
+    """
+    n = len(panel_rects)
+
+    def _inter(a, b):
+        x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+        x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+        return (x0, y0, x1, y1) if x1 - x0 > 2 and y1 - y0 > 2 else None
+
+    def _contains(a, b):
+        return (a[0] <= b[0] and a[1] <= b[1] and a[2] >= b[2] and a[3] >= b[3])
+
+    def _region_vec(tile, paste, region, size=8):
+        """素材 tile 在源图坐标 region 处的对应画面(经回贴矩形映射)。"""
+        px0, py0, pw, ph = paste
+        if pw <= 0 or ph <= 0:
+            return None
+        rx0 = (region[0] - px0) / pw * tile.width
+        ry0 = (region[1] - py0) / ph * tile.height
+        rx1 = (region[2] - px0) / pw * tile.width
+        ry1 = (region[3] - py0) / ph * tile.height
+        rx0, ry0 = max(0, int(rx0)), max(0, int(ry0))
+        rx1 = min(tile.width, int(math.ceil(rx1)))
+        ry1 = min(tile.height, int(math.ceil(ry1)))
+        if rx1 - rx0 < 1 or ry1 - ry0 < 1:
+            return None
+        return _thumb_vec(tile.crop((rx0, ry0, rx1, ry1)), size)
+
+    edges = []  # (下, 上)
+    for i in range(n):
+        for j in range(i + 1, n):
+            ov = _inter(panel_rects[i], panel_rects[j])
+            if not ov:
+                continue
+            if _contains(panel_rects[i], panel_rects[j]):
+                edges.append((i, j))  # j 完全在 i 内 → j 在上
+                continue
+            if _contains(panel_rects[j], panel_rects[i]):
+                edges.append((j, i))
+                continue
+            # 部分重合:重叠区取色
+            ti, tj = tiles_by_panel.get(i), tiles_by_panel.get(j)
+            if not ti or not tj:
+                continue
+            region = (int(ov[0]), int(ov[1]), int(math.ceil(ov[2])),
+                      int(math.ceil(ov[3])))
+            src_vec = _thumb_vec(src.crop(region), 8)
+            vi = _region_vec(ti[0], ti[1], region)
+            vj = _region_vec(tj[0], tj[1], region)
+            if vi is None or vj is None:
+                continue
+            di, dj = _vec_dist(src_vec, vi), _vec_dist(src_vec, vj)
+            # 更像源图重叠区的在上
+            edges.append((j, i) if di < dj else (i, j))
+
+    # Kahn 拓扑;环则退化为面积降序
+    from collections import defaultdict, deque
+    indeg = [0] * n
+    adj = defaultdict(set)
+    for lo, hi in edges:
+        if hi not in adj[lo]:
+            adj[lo].add(hi)
+            indeg[hi] += 1
+    q = deque(sorted((i for i in range(n) if indeg[i] == 0),
+                     key=lambda i: -((panel_rects[i][2] - panel_rects[i][0])
+                                     * (panel_rects[i][3] - panel_rects[i][1]))))
+    z = {}
+    order = 0
+    while q:
+        u = q.popleft()
+        z[u] = order
+        order += 1
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+    if len(z) < n:  # 有环,剩余按面积降序垫底后排
+        rest = sorted((i for i in range(n) if i not in z),
+                      key=lambda i: -((panel_rects[i][2] - panel_rects[i][0])
+                                      * (panel_rects[i][3] - panel_rects[i][1])))
+        for u in rest:
+            z[u] = order
+            order += 1
+    return z
+
+
+def handle_panel_asset(payload: dict) -> dict:
+    """第 16+ 步:把 nano banana 的绿底平铺图切割成 panel 素材并匹配回原位。
+
+    链路:自适应色键去绿底 → 连通域切块 → 与检测 panel 做
+    "长宽比 + 16×16 色彩网格"双特征代价匹配(贪心全局最小)→
+    素材存 panel_assets/p<idx>.png(idx=原 panel 下标),manifest 记录回贴矩形。
+
+    payload:
+        run_id / dir   二选一
+        image          绿底平铺图,默认 panels_green.png
+        source         视觉比对源图,默认 mid_fill.png
+        panels         可选 [[cx,cy,w,h],...](归一化);缺省读 structure1.json
+                       的 panel 字段(过滤 yolo_detect=discard)
+        tol            色键容差,默认 60;defringe 默认 1
+        supersample    默认 2:平铺图放大 N 倍后再色键切割,边缘更平滑;1=关闭
+        layers         可选 [[panel下标,...],...]:分层模式——第 16 步逐层原位
+                       生成的 panels_green_L<k>.png 按 bbox 直裁,无匹配环节
+        canvas         分层模式配套 {size:[cw,ch], scale, offset:[ox,oy]}:
+                       源图垫绿到 GPT 预设画布的变换,裁切在画布空间进行
+        mask_mode      默认 chroma:纯色键软阈值出边;
+                       传 "sam2" 改用 SAM2 按块出轮廓(实测圆角/边缘行为不合预期,已弃用为默认)
+        sam2           可选,SAM2 出边参数覆盖:{padding_ratio, min_padding,
+                       mask_threshold, feather_radius, crop_scale, refine,
+                       multimask, fill_holes, grow(角部外扩px,默认2),
+                       guard_grow(护栏外扩px,默认1——治四边被色键削掉的问题)}
+    结果:count_panels/count_tiles(数量审计)、assets(含匹配代价,cost
+    越小越可信,>0.5 标 uncertain)、source_size。
+    """
+    if payload.get("dir"):
+        run_dir = Path(payload["dir"])
+    else:
+        run_dir = storage.get_run_dir(payload["run_id"])
+    sheet_path = run_dir / (payload.get("image") or "panels_green.png")
+    src_path = run_dir / (payload.get("source") or "mid_fill.png")
+    for p in (sheet_path, src_path):
+        if not p.is_file():
+            raise FileNotFoundError(f"input not found: {p}")
+
+    panels = payload.get("panels")
+    if not panels:
+        import json as _json
+        sj = run_dir / "structure1.json"
+        if not sj.is_file():
+            raise ValueError("payload.panels missing and structure1.json not found")
+        structured = _json.loads(sj.read_text(encoding="utf-8"))
+        panels = [item["bbox"] for item in structured.get("panel", [])
+                  if item.get("yolo_detect") != "discard"]
+    if not panels:
+        raise ValueError("no panels to match")
+
+    started = time.time()
+    with Image.open(sheet_path) as im:
+        sheet = im.convert("RGB")
+    with Image.open(src_path) as im:
+        src = im.convert("RGB")
+    sw, sh = src.size
+
+    # 切割侧超采样:把平铺图放大 N 倍后再做色键——软阈值 alpha 在更细的
+    # 网格上计算,defringe 的有效收缩减为 1/N px,边缘量化更平滑;
+    # 素材落盘不缩回,天然多带一层分辨率余量(回贴时等比缩小)
+    ss = max(1, int(payload.get("supersample", 2)))
+    if ss > 1:
+        sheet = sheet.resize((sheet.width * ss, sheet.height * ss),
+                             Image.Resampling.LANCZOS)
+
+    tol = int(payload.get("tol", 60))
+    defringe = int(payload.get("defringe", 1))
+
+    # 槽位模式:第 16 步用"对号入座"模板生成时,槽位表已随图上传——
+    # 直接按槽位矩形裁切,对应关系由构造保证,匹配环节整体消失
+    # 分层模式:第 16 步逐层"原位保留+剥离"生成时,每层是与源图同布局的
+    # 绿底图(panels_green_L<k>.png)——位置已知,按 bbox 直裁,无匹配环节
+    layers = payload.get("layers")
+    canvas_fit = payload.get("canvas")  # {size:[cw,ch], scale, offset:[ox,oy]}
+    if layers:
+        out_dir = run_dir / "panel_assets"
+        out_dir.mkdir(exist_ok=True)
+        for old_f in out_dir.glob("p*.png"):
+            old_f.unlink()
+
+        def _panel_rect(b):
+            return ((b[0] - b[2] / 2) * sw, (b[1] - b[3] / 2) * sh,
+                    (b[0] + b[2] / 2) * sw, (b[1] + b[3] / 2) * sh)
+
+        panel_rects = [_panel_rect(b) for b in panels]
+        assets = []
+        rows = []
+        tiles_by_panel = {}
+        margin = 6 * ss
+        for k, layer in enumerate(layers):
+            lp = run_dir / f"panels_green_L{k}.png"
+            if not lp.is_file():
+                for pi in layer:
+                    rows.append({"panel_index": pi, "file": "",
+                                 "cost": 1.0, "uncertain": True,
+                                 "low_res": False, "res_ratio": 0,
+                                 "verify": "warn", "vdist": 1.0,
+                                 "ar_diff": 0, "z": 0, "png_w": 0,
+                                 "png_h": 0, "paste_x": 0, "paste_y": 0,
+                                 "paste_w": 0, "paste_h": 0})
+                continue
+            with Image.open(lp) as im:
+                lsheet = im.convert("RGB")
+            # 画布空间裁切:层图归一化到"预设画布尺寸×ss"(与 GPT 输出同比例,
+            # 只有分辨率缩放没有比例拉伸);panel 矩形经 scale/offset 变换定位
+            if canvas_fit:
+                cw_, ch_ = canvas_fit["size"]
+                c_scale = float(canvas_fit["scale"])
+                ox, oy = canvas_fit["offset"]
+            else:
+                cw_, ch_, c_scale, ox, oy = sw, sh, 1.0, 0, 0
+            lsheet = lsheet.resize((int(cw_) * ss, int(ch_) * ss),
+                                   Image.Resampling.LANCZOS)
+            key = _border_median_color(lsheet)
+            for pi in layer:
+                if pi >= len(panels):
+                    continue
+                x0, y0, x1, y1 = panel_rects[pi]
+                # 源图坐标 → 画布坐标
+                x0c, y0c = x0 * c_scale + ox, y0 * c_scale + oy
+                x1c, y1c = x1 * c_scale + ox, y1 * c_scale + oy
+                cx0 = max(0, int(x0c * ss - margin))
+                cy0 = max(0, int(y0c * ss - margin))
+                cx1 = min(lsheet.width, int(math.ceil(x1c * ss + margin)))
+                cy1 = min(lsheet.height, int(math.ceil(y1c * ss + margin)))
+                crop = lsheet.crop((cx0, cy0, cx1, cy1))
+                cut = _unkey_border(crop, tol, defringe, key=key, junk=False)
+                tight = cut.getchannel("A").getbbox()
+                if not tight:
+                    rows.append({"panel_index": pi, "file": "",
+                                 "cost": 1.0, "uncertain": True,
+                                 "low_res": False, "res_ratio": 0,
+                                 "verify": "warn", "vdist": 1.0,
+                                 "ar_diff": 0, "z": 0, "png_w": 0,
+                                 "png_h": 0, "paste_x": 0, "paste_y": 0,
+                                 "paste_w": 0, "paste_h": 0})
+                    continue
+                tile = cut.crop(tight)
+                fname = f"p{pi:02d}.png"
+                tile.save(out_dir / fname)
+                bw, bh = x1 - x0, y1 - y0
+                src_crop = src.crop((max(0, int(x0)), max(0, int(y0)),
+                                     min(sw, int(math.ceil(x1))),
+                                     min(sh, int(math.ceil(y1)))))
+                vdist = _vec_dist(_thumb_vec(tile, 32),
+                                  _thumb_vec(src_crop, 32))
+                ar_diff = abs(math.log(max(
+                    1e-6, (tile.width / max(1, tile.height))
+                    / max(1e-6, bw / max(1.0, bh)))))
+                res_ratio = round(
+                    min(tile.width / max(1.0, bw * c_scale * ss),
+                        tile.height / max(1.0, bh * c_scale * ss)) * ss, 2)
+                paste = (int(round(x0)), int(round(y0)),
+                         max(1, int(round(bw))), max(1, int(round(bh))))
+                tiles_by_panel[pi] = (tile, paste)
+                rec = {
+                    "panel_index": pi, "file": fname, "cost": 0.0,
+                    "uncertain": vdist >= 0.25,
+                    "low_res": res_ratio < 0.9, "res_ratio": res_ratio,
+                    "verify": "ok" if vdist < 0.25 else "warn",
+                    "vdist": round(vdist, 4), "ar_diff": round(ar_diff, 4),
+                    "png_w": tile.width, "png_h": tile.height,
+                    "bbox": panels[pi],
+                    "paste_x": paste[0], "paste_y": paste[1],
+                    "paste_w": paste[2], "paste_h": paste[3],
+                }
+                assets.append(rec)
+                rows.append(rec)
+        z_map = _panel_z_order(panel_rects, tiles_by_panel, src)
+        for rec in assets:
+            rec["z"] = z_map.get(rec["panel_index"], 0)
+        fields = ["panel_index", "file", "cost", "uncertain", "verify",
+                  "vdist", "ar_diff", "res_ratio", "low_res", "z",
+                  "png_w", "png_h", "paste_x", "paste_y",
+                  "paste_w", "paste_h"]
+        manifest_path = out_dir / "manifest.csv"
+        with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields,
+                                    extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        return {
+            "mask_mode_used": "layers",
+            "sam2_error": None,
+            "count_panels": len(panels),
+            "count_tiles": len([r for r in rows if r["file"]]),
+            "matched": len(assets),
+            "count_ok": len(assets) == len(panels),
+            "assets": sorted(assets, key=lambda a: a["panel_index"]),
+            "manifest": str(manifest_path),
+            "source_size": [sw, sh],
+            "elapsed_sec": round(time.time() - started, 1),
+        }
+
+    # 槽位模式仅在显式传 payload.slots 时启用(实验通道;
+    # 不自动读 run 目录残留的 panels_slots.json,防止劫持常规切割)
+    slots_data = payload.get("slots")
+    if slots_data and slots_data.get("slots"):
+        tw_, th_ = (int(v) * ss for v in slots_data["size"])
+        if sheet.size != (tw_, th_):
+            sheet = sheet.resize((tw_, th_), Image.Resampling.LANCZOS)
+
+        # 连通域切块(GPT 几何服从性弱,槽位只当"匹配锚点"不当裁剪边界):
+        # 每块与每个槽位算 IoU,按 IoU 从大到小贪心配对;IoU 太低的槽位
+        # 回落外观匹配(色彩网格)兜底
+        rgba_sheet = _unkey_border(sheet, tol, defringe)
+        comp_boxes = _connected_tiles(rgba_sheet)
+
+        def _iou(a, b):
+            ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+            ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+            if ix1 <= ix0 or iy1 <= iy0:
+                return 0.0
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            area_a = (a[2] - a[0]) * (a[3] - a[1])
+            area_b = (b[2] - b[0]) * (b[3] - b[1])
+            return inter / max(1.0, area_a + area_b - inter)
+
+        slot_rects = {}
+        for slot in slots_data["slots"]:
+            pi = int(slot["index"])
+            if pi >= len(panels):
+                continue
+            sx, sy, sw2, sh2 = (int(v) * ss for v in slot["rect"])
+            slot_rects[pi] = (sx, sy, sx + sw2, sy + sh2)
+
+        # IoU 贪心配对
+        cand = sorted(((_iou(comp_boxes[ci], slot_rects[pi]), ci, pi)
+                       for ci in range(len(comp_boxes))
+                       for pi in slot_rects),
+                      reverse=True)
+        comp_of = {}
+        used_c = set()
+        for v, ci, pi in cand:
+            if v < 0.15 or ci in used_c or pi in comp_of:
+                continue
+            comp_of[pi] = (ci, v)
+            used_c.add(ci)
+
+        def _panel_rect(b):
+            return ((b[0] - b[2] / 2) * sw, (b[1] - b[3] / 2) * sh,
+                    (b[0] + b[2] / 2) * sw, (b[1] + b[3] / 2) * sh)
+
+        panel_rects = [_panel_rect(b) for b in panels]
+
+        # 外观兜底:没被 IoU 认领的槽位 × 没被认领的块
+        rest_p = [pi for pi in slot_rects if pi not in comp_of]
+        rest_c = [ci for ci in range(len(comp_boxes)) if ci not in used_c]
+        if rest_p and rest_c:
+            pv = {}
+            for pi in rest_p:
+                x0, y0, x1, y1 = panel_rects[pi]
+                pv[pi] = _thumb_vec(src.crop(
+                    (max(0, int(x0)), max(0, int(y0)),
+                     min(sw, int(math.ceil(x1))), min(sh, int(math.ceil(y1))))))
+            cv = {ci: _thumb_vec(rgba_sheet.crop(comp_boxes[ci]))
+                  for ci in rest_c}
+            flat2 = sorted(((_vec_dist(cv[ci], pv[pi]), ci, pi)
+                            for ci in rest_c for pi in rest_p))
+            for v, ci, pi in flat2:
+                if ci in used_c or pi in comp_of:
+                    continue
+                comp_of[pi] = (ci, 0.0)
+                used_c.add(ci)
+
+        out_dir = run_dir / "panel_assets"
+        out_dir.mkdir(exist_ok=True)
+        for old_f in out_dir.glob("p*.png"):
+            old_f.unlink()
+        assets = []
+        rows = []
+        tiles_by_panel = {}
+        for pi in sorted(slot_rects):
+            if pi not in comp_of:
+                rows.append({"panel_index": pi, "file": "", "cost": 1.0,
+                             "uncertain": True, "low_res": False,
+                             "res_ratio": 0, "verify": "warn", "vdist": 1.0,
+                             "ar_diff": 0, "z": 0, "png_w": 0, "png_h": 0,
+                             "paste_x": 0, "paste_y": 0,
+                             "paste_w": 0, "paste_h": 0})
+                continue
+            ci, iou_v = comp_of[pi]
+            tile = rgba_sheet.crop(comp_boxes[ci])
+            fname = f"p{pi:02d}.png"
+            tile.save(out_dir / fname)
+            x0, y0, x1, y1 = panel_rects[pi]
+            bw, bh = x1 - x0, y1 - y0
+            src_crop = src.crop((max(0, int(x0)), max(0, int(y0)),
+                                 min(sw, int(math.ceil(x1))),
+                                 min(sh, int(math.ceil(y1)))))
+            vdist = _vec_dist(_thumb_vec(tile, 32), _thumb_vec(src_crop, 32))
+            ar_diff = abs(math.log(max(1e-6, (tile.width / max(1, tile.height))
+                                       / max(1e-6, bw / max(1.0, bh)))))
+            res_ratio = round(min(tile.width / max(1, bw),
+                                  tile.height / max(1, bh)), 2)
+            paste = (int(round(x0)), int(round(y0)),
+                     max(1, int(round(bw))), max(1, int(round(bh))))
+            tiles_by_panel[pi] = (tile, paste)
+            rec = {
+                "panel_index": pi, "file": fname,
+                "cost": round(1 - iou_v, 4),
+                "uncertain": vdist >= 0.25,
+                "low_res": res_ratio < 0.9, "res_ratio": res_ratio,
+                "verify": "ok" if vdist < 0.25 else "warn",
+                "vdist": round(vdist, 4), "ar_diff": round(ar_diff, 4),
+                "png_w": tile.width, "png_h": tile.height,
+                "bbox": panels[pi],
+                "paste_x": paste[0], "paste_y": paste[1],
+                "paste_w": paste[2], "paste_h": paste[3],
+            }
+            assets.append(rec)
+            rows.append(rec)
+        z_map = _panel_z_order(panel_rects, tiles_by_panel, src)
+        for rec in assets:
+            rec["z"] = z_map.get(rec["panel_index"], 0)
+        fields = ["panel_index", "file", "cost", "uncertain", "verify",
+                  "vdist", "ar_diff", "res_ratio", "low_res", "z",
+                  "png_w", "png_h", "paste_x", "paste_y", "paste_w", "paste_h"]
+        manifest_path = out_dir / "manifest.csv"
+        with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        return {
+            "mask_mode_used": "slots",
+            "sam2_error": None,
+            "count_panels": len(panels),
+            "count_tiles": len([r for r in rows if r["file"]]),
+            "matched": len(assets),
+            "count_ok": len(assets) == len(panels),
+            "assets": sorted(assets, key=lambda a: a["panel_index"]),
+            "manifest": str(manifest_path),
+            "source_size": [sw, sh],
+            "elapsed_sec": round(time.time() - started, 1),
+        }
+
+    rgba = _unkey_border(sheet, tol, defringe)
+    tile_boxes = _connected_tiles(rgba)
+
+    # 出边模式:默认 sam2——色键只负责找块和计数,轮廓交给 SAM2(按物体边缘
+    # 而非颜色距离,GPT 边缘混色像素/淡影对它无感);失败自动回落色键结果
+    mask_mode = payload.get("mask_mode", "chroma")
+    sam_cfg = payload.get("sam2") or {}
+    mask_mode_used = "chroma"
+    sam2_error = None
+    if mask_mode == "sam2" and tile_boxes:
+        try:
+            gw, gh = sheet.size
+            cut_name = "_panel_sam_cut.png"
+            sam2c.cutout({
+                "dir": str(run_dir), "image": sheet_path.name,
+                "output": cut_name,
+                "borders": [{"bbox": [((b[0] + b[2]) / 2) / gw,
+                                      ((b[1] + b[3]) / 2) / gh,
+                                      (b[2] - b[0]) / gw,
+                                      (b[3] - b[1]) / gh],
+                             "positive_points": [], "negative_points": []}
+                            for b in tile_boxes],
+                "padding_ratio": float(sam_cfg.get("padding_ratio", 0.02)),
+                "min_padding": float(sam_cfg.get("min_padding", 2)),
+                "mask_threshold": float(sam_cfg.get("mask_threshold", 0.5)),
+                "feather_radius": float(sam_cfg.get("feather_radius", 0)),
+                "multimask": bool(sam_cfg.get("multimask", False)),
+                "crop_scale": float(sam_cfg.get("crop_scale", 1.5)),
+                "refine": bool(sam_cfg.get("refine", True)),
+                "fill_holes": bool(sam_cfg.get("fill_holes", True)),
+                "size_rules": [],
+            })
+            cut_path = run_dir / cut_name
+            with Image.open(cut_path) as c:
+                sam_rgba = c.convert("RGBA")
+            cut_path.unlink(missing_ok=True)
+            if sam_rgba.size != sheet.size:
+                sam_rgba = sam_rgba.resize(sheet.size, Image.Resampling.LANCZOS)
+            # SAM2 在角部置信度低,掩码会系统性削角:先外扩 2px 把角"长回来",
+            # 再用色键软 alpha(不收缩版)做颜色护栏——只允许长回非绿像素,
+            # 角恢复到真实颜色边界为止,绿像素一个进不来
+            hard = sam_rgba.getchannel("A").point(
+                lambda v: 255 if v >= 128 else 0)
+            grow_px = int(sam_cfg.get("grow", 2))
+            grown = (hard.filter(ImageFilter.MaxFilter(2 * grow_px + 1))
+                     if grow_px > 0 else hard)
+            guard = _unkey_border(sheet, tol, 0)
+            guard_alpha = guard.getchannel("A")
+            # 护栏外扩:色键会把边缘抗锯齿混合带切掉(四边削像素的真正来源),
+            # 允许最终边界越过颜色边界 guard_grow px,混合带以半透明回归,
+            # despill 负责压掉其中的绿色成分
+            gg = int(sam_cfg.get("guard_grow", 1))
+            if gg > 0:
+                guard_alpha = guard_alpha.filter(
+                    ImageFilter.MaxFilter(2 * gg + 1))
+            final_alpha = ImageChops.darker(grown, guard_alpha)
+            key = _border_median_color(sheet)
+            out = _despill_edges(sheet, final_alpha, key).convert("RGBA")
+            out.putalpha(final_alpha)
+            rgba = out
+            mask_mode_used = "sam2"
+        except Exception as e:  # 回落色键 rgba,但把原因透出去
+            sam2_error = f"{type(e).__name__}: {e}"[-300:]
+
+    tiles = [rgba.crop(b) for b in tile_boxes]
+
+    # 双特征代价矩阵:长宽比 + 色彩网格
+    def _panel_rect(b):
+        return ((b[0] - b[2] / 2) * sw, (b[1] - b[3] / 2) * sh,
+                (b[0] + b[2] / 2) * sw, (b[1] + b[3] / 2) * sh)
+
+    panel_rects = [_panel_rect(b) for b in panels]
+    panel_vecs = []
+    panel_ars = []
+    for (x0, y0, x1, y1) in panel_rects:
+        crop = src.crop((max(0, int(x0)), max(0, int(y0)),
+                         min(sw, int(math.ceil(x1))), min(sh, int(math.ceil(y1)))))
+        panel_vecs.append(_thumb_vec(crop))
+        panel_ars.append((x1 - x0) / max(1e-6, (y1 - y0)))
+    tile_vecs = [_thumb_vec(t) for t in tiles]
+    tile_ars = [t.width / max(1, t.height) for t in tiles]
+
+    cost = [[abs(math.log(max(1e-6, tile_ars[ti] / panel_ars[pi])))
+             + 2.0 * _vec_dist(tile_vecs[ti], panel_vecs[pi])
+             for pi in range(len(panels))] for ti in range(len(tiles))]
+
+    # 贪心全局最小分配
+    pairs = []
+    used_t, used_p = set(), set()
+    flat = sorted(((cost[ti][pi], ti, pi)
+                   for ti in range(len(tiles)) for pi in range(len(panels))))
+    for c, ti, pi in flat:
+        if ti in used_t or pi in used_p:
+            continue
+        pairs.append((ti, pi, c))
+        used_t.add(ti)
+        used_p.add(pi)
+
+    # 2-opt 交换优化:修正贪心的次优配对,直至总代价不再下降
+    improved = True
+    while improved:
+        improved = False
+        for a in range(len(pairs)):
+            for b in range(a + 1, len(pairs)):
+                ta, pa, ca = pairs[a]
+                tb, pb, cb = pairs[b]
+                if cost[ta][pb] + cost[tb][pa] + 1e-9 < ca + cb:
+                    pairs[a] = (ta, pb, cost[ta][pb])
+                    pairs[b] = (tb, pa, cost[tb][pa])
+                    improved = True
+
+    out_dir = run_dir / "panel_assets"
+    out_dir.mkdir(exist_ok=True)
+    for old in out_dir.glob("p*.png"):
+        old.unlink()
+    assets = []
+    rows = []
+    tiles_by_panel = {}
+    for ti, pi, c in pairs:
+        tile = tiles[ti]
+        fname = f"p{pi:02d}.png"
+        tile.save(out_dir / fname)
+        x0, y0, x1, y1 = panel_rects[pi]
+        bw, bh = x1 - x0, y1 - y0
+        # 拉伸填满 bbox(几何权威):GPT 比例略偏时在拼回环节强行矫正;
+        # 比例偏差大小由 ar_diff 复核记录,超阈标 warn 提示生成没守约
+        paste = (int(round(x0)), int(round(y0)),
+                 max(1, int(round(bw))), max(1, int(round(bh))))
+        # 回贴前加强复核:32×32 高分辨率比色 + 长宽比偏差,双阈值确认位置与大小
+        src_crop = src.crop((max(0, int(x0)), max(0, int(y0)),
+                             min(sw, int(math.ceil(x1))),
+                             min(sh, int(math.ceil(y1)))))
+        vdist = _vec_dist(_thumb_vec(tile, 32), _thumb_vec(src_crop, 32))
+        ar_diff = abs(math.log(max(1e-6,
+                                   (tile.width / max(1, tile.height))
+                                   / panel_ars[pi])))
+        verify = "ok" if (vdist < 0.18 and ar_diff < 0.25) else "warn"
+        # 分辨率比:素材像素 ÷ 回贴目标像素,<0.9 说明画小了、拉回会糊
+        res_ratio = round(min(tile.width / max(1, bw),
+                              tile.height / max(1, bh)), 2)
+        tiles_by_panel[pi] = (tile, paste)
+        rec = {
+            "panel_index": pi, "file": fname, "cost": round(c, 4),
+            "uncertain": c > 0.5 or verify == "warn",
+            "low_res": res_ratio < 0.9,
+            "res_ratio": res_ratio,
+            "verify": verify, "vdist": round(vdist, 4),
+            "ar_diff": round(ar_diff, 4),
+            "png_w": tile.width, "png_h": tile.height,
+            "bbox": panels[pi],
+            "paste_x": paste[0], "paste_y": paste[1],
+            "paste_w": paste[2], "paste_h": paste[3],
+        }
+        assets.append(rec)
+        rows.append(rec)
+
+    # 前后叠放次序(z 越大越靠上):包含→内者在上;相交→重叠区取色裁决
+    z_map = _panel_z_order(panel_rects, tiles_by_panel, src)
+    for rec in assets:
+        rec["z"] = z_map.get(rec["panel_index"], 0)
+
+    fields = ["panel_index", "file", "cost", "uncertain", "verify", "vdist",
+              "ar_diff", "res_ratio", "low_res", "z", "png_w", "png_h",
+              "paste_x", "paste_y", "paste_w", "paste_h"]
+    manifest_path = out_dir / "manifest.csv"
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return {
+        "mask_mode_used": mask_mode_used,
+        "sam2_error": sam2_error,
+        "count_panels": len(panels), "count_tiles": len(tiles),
+        "matched": len(pairs),
+        "count_ok": len(tiles) == len(panels),
+        "assets": sorted(assets, key=lambda a: a["panel_index"]),
+        "manifest": str(manifest_path),
+        "source_size": [sw, sh],
+        "elapsed_sec": round(time.time() - started, 1),
+    }
+
+
+def _z_order_extract(rects):
+    """提取场景的 z 序(合成图上无法取色裁决):
+    包含 → 内者在上;部分相交 → 面积小者在上(UI 常识);Kahn 拓扑,环按面积降序兜底。"""
+    n = len(rects)
+
+    def _inter(a, b):
+        x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+        x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+        return x1 - x0 > 2 and y1 - y0 > 2
+
+    def _contains(a, b):
+        return a[0] <= b[0] and a[1] <= b[1] and a[2] >= b[2] and a[3] >= b[3]
+
+    def _area(r):
+        return (r[2] - r[0]) * (r[3] - r[1])
+
+    from collections import defaultdict, deque
+    adj = defaultdict(set)
+    indeg = [0] * n
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not _inter(rects[i], rects[j]):
+                continue
+            if _contains(rects[i], rects[j]):
+                lo, hi = i, j
+            elif _contains(rects[j], rects[i]):
+                lo, hi = j, i
+            else:
+                lo, hi = ((i, j) if _area(rects[i]) >= _area(rects[j])
+                          else (j, i))
+            if hi not in adj[lo]:
+                adj[lo].add(hi)
+                indeg[hi] += 1
+    q = deque(sorted((i for i in range(n) if indeg[i] == 0),
+                     key=lambda i: -_area(rects[i])))
+    z = {}
+    order = 0
+    while q:
+        u = q.popleft()
+        z[u] = order
+        order += 1
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+    for u in sorted((i for i in range(n) if i not in z),
+                    key=lambda i: -_area(rects[i])):
+        z[u] = order
+        order += 1
+    return z
+
+
+def _geodesic_connected(candidate: Image.Image, seed: Image.Image,
+                        iters: int = 200) -> Image.Image:
+    """保留 candidate 中与 seed 相连的部分(测地膨胀,512 缩略网格上做)。
+
+    用途:候选隐藏区只认"与可见本体相邻"的遮挡,隔空的杂物剔除。"""
+    w, h = candidate.size
+    scale = min(1.0, 512 / max(w, h))
+    sw_, sh_ = max(1, round(w * scale)), max(1, round(h * scale))
+    cand = candidate.resize((sw_, sh_), Image.Resampling.NEAREST) \
+        .point(lambda v: 255 if v > 0 else 0)
+    marker = seed.resize((sw_, sh_), Image.Resampling.NEAREST) \
+        .point(lambda v: 255 if v > 0 else 0)
+    allowed = ImageChops.lighter(cand, marker)
+    prev = None
+    for _ in range(iters):
+        marker = ImageChops.darker(
+            marker.filter(ImageFilter.MaxFilter(3)), allowed)
+        cur = marker.tobytes()
+        if cur == prev:
+            break
+        prev = cur
+    keep = ImageChops.darker(marker, cand)
+    return keep.resize((w, h), Image.Resampling.NEAREST)
+
+
+def handle_panel_extract(payload: dict) -> dict:
+    """第 16/17 替代:确定性 panel 提取(零生成式排版,几何零漂移)。
+
+    逐 panel:SAM2 在 mid_fill 上按 bbox 抠可见部分 → z 序(包含→内者在上,
+    相交→面积小者在上)→ 被上层 panel 压住的区域(上层 mask ∩ 本框)用
+    flux_fill 原位补全(panel_fill LoRA)→ 输出逐 panel RGBA + manifest。
+
+    payload:
+        run_id / dir   二选一
+        panels         必填 [[cx,cy,w,h],...](归一化)
+        image          源图,默认 mid_fill.png
+        lora           默认 panel_fill.safetensors(传空串禁用)
+        seed/steps/guidance      fill 参数,默认 9/20/30
+        grow/blur      洞外扩/羽化 px,默认 4/2
+        margin_ratio   fill 裁块上下文外扩,默认 0.25
+    输出:panel_extract/p<idx>.png + manifest.csv(paste 矩形、z、是否补过洞)
+    """
+    if payload.get("dir"):
+        run_dir = Path(payload["dir"])
+    else:
+        run_dir = storage.get_run_dir(payload["run_id"])
+    panels = payload.get("panels")
+    if not panels:
+        raise ValueError("payload.panels must be a non-empty array")
+    src_path = run_dir / (payload.get("image") or "mid_fill.png")
+    if not src_path.is_file():
+        raise FileNotFoundError(f"input not found: {src_path}")
+    with Image.open(src_path) as im:
+        src = im.convert("RGB")
+    sw, sh = src.size
+
+    lora = payload.get("lora", "panel_fill.safetensors") or None
+    seed = int(payload.get("seed", 9))
+    steps = int(payload.get("steps", 20))
+    guidance = float(payload.get("guidance", 30.0))
+    grow = int(payload.get("grow", 4))
+    blur = float(payload.get("blur", 2))
+    margin_ratio = float(payload.get("margin_ratio", 0.25))
+
+    def _rect(b):
+        return (max(0, int((b[0] - b[2] / 2) * sw)),
+                max(0, int((b[1] - b[3] / 2) * sh)),
+                min(sw, int(math.ceil((b[0] + b[2] / 2) * sw))),
+                min(sh, int(math.ceil((b[1] + b[3] / 2) * sh))))
+
+    rects = [_rect(b) for b in panels]
+    started = time.time()
+
+    # ① 逐 panel SAM2 抠可见部分(全画布 alpha)
+    alphas = []
+    for i, b in enumerate(panels):
+        tmp = f"_pe_cut_{i:02d}.png"
+        try:
+            sam2c.cutout({
+                "dir": str(run_dir), "image": src_path.name, "output": tmp,
+                "borders": [{"bbox": b, "positive_points": [],
+                             "negative_points": []}],
+                "padding_ratio": 0.02, "min_padding": 2,
+                "mask_threshold": 0.5, "feather_radius": 0,
+                "multimask": False, "crop_scale": 1.5, "refine": True,
+                "fill_holes": True, "size_rules": [],
+            })
+            tmp_path = run_dir / tmp
+            with Image.open(tmp_path) as c:
+                a = c.convert("RGBA").getchannel("A").point(
+                    lambda v: 255 if v > 0 else 0)
+            tmp_path.unlink(missing_ok=True)
+        except RuntimeError:
+            a = Image.new("L", (sw, sh), 0)
+        if a.size != (sw, sh):
+            a = a.resize((sw, sh), Image.Resampling.NEAREST)
+        alphas.append(a)
+
+    # ② z 序与上层遮挡
+    z_map = _z_order_extract(rects)
+    out_dir = run_dir / "panel_extract"
+    out_dir.mkdir(exist_ok=True)
+    for old_f in out_dir.glob("p*.png"):
+        old_f.unlink()
+
+    assets = []
+    rows = []
+    for i, b in enumerate(panels):
+        x0, y0, x1, y1 = rects[i]
+        # 工作区放宽:真实边界可能藏在遮挡物下、超出 YOLO 框——
+        # 候选隐藏区 = 上层 mask ∩ "bbox 外扩 40% 长边"的矩形(隐藏部分只会
+        # 紧邻可见部分,放宽有界)
+        d = max(24, round(max(x1 - x0, y1 - y0) * 0.4))
+        ex0, ey0 = max(0, x0 - d), max(0, y0 - d)
+        ex1, ey1 = min(sw, x1 + d), min(sh, y1 + d)
+        exp_mask = Image.new("L", (sw, sh), 0)
+        ImageDraw.Draw(exp_mask).rectangle([ex0, ey0, ex1 - 1, ey1 - 1],
+                                           fill=255)
+        upper = Image.new("L", (sw, sh), 0)
+        for j in range(len(panels)):
+            if z_map[j] > z_map[i]:
+                upper = ImageChops.lighter(upper, alphas[j])
+        hole = ImageChops.multiply(upper, exp_mask)
+        # 洞不含可见本体(可见处不重绘)
+        hole = ImageChops.subtract(hole, alphas[i])
+        # 连通性约束:只认与可见本体相连的遮挡区,隔空杂物剔除
+        if hole.getbbox():
+            hole = _geodesic_connected(hole, alphas[i])
+        filled = bool(hole.getbbox())
+        vis_area = sum(1 for v in alphas[i].getdata() if v)
+        hole_area = sum(1 for v in hole.getdata() if v) if filled else 0
+        hidden_ratio = round(hole_area / max(1, vis_area), 3)
+
+        # 裁块窗口覆盖 可见∪候选隐藏区
+        ub = ImageChops.lighter(alphas[i], hole).getbbox() or (x0, y0, x1, y1)
+        m = max(16, round(max(ub[2] - ub[0], ub[3] - ub[1]) * margin_ratio))
+        cx0, cy0 = max(0, ub[0] - m), max(0, ub[1] - m)
+        cx1, cy1 = min(sw, ub[2] + m), min(sh, ub[3] + m)
+        crop = src.crop((cx0, cy0, cx1, cy1))
+        if filled:
+            # ③ 原位 inpaint 候选隐藏区(panel_fill 训练目标=完整下层 panel,
+            # 模型会画出被压住的延续和真实收边)
+            hole_crop = hole.crop((cx0, cy0, cx1, cy1))
+            if grow > 0:
+                hole_crop = hole_crop.filter(
+                    ImageFilter.MaxFilter(2 * grow + 1))
+            soft = hole_crop.filter(ImageFilter.GaussianBlur(blur)) \
+                if blur > 0 else hole_crop
+            img_name = comfy.place_input_pil(crop, prefix=f"pe_{i:02d}_")
+            mask_name = comfy.place_input_pil(
+                soft.convert("RGB"), prefix=f"pe_mask_{i:02d}_")
+            entry = comfy.run_workflow(build_flux_fill_workflow(
+                image_name=img_name, mask_name=mask_name,
+                prompt=DEFAULT_RESIDUAL_FILL_PROMPT,
+                seed=seed, steps=steps,
+                width=crop.width, height=crop.height,
+                guidance=guidance, lora_name=lora))
+            images = comfy.output_image_paths(entry)
+            if images:
+                with Image.open(images[0]) as g:
+                    gen = g.convert("RGB")
+                    if gen.size != crop.size:
+                        gen = gen.resize(crop.size, Image.Resampling.LANCZOS)
+                gen, _ = _match_colors_to_input(gen, crop, soft.convert("RGB"))
+                crop = Image.composite(gen, crop, soft)
+
+        # ④ 定界:补全后的裁块上重新 SAM2 测真实边界(补完再定界,
+        # 不再信被遮挡的视觉边界/YOLO 框);未补洞的直接用可见 mask
+        region = ImageChops.lighter(alphas[i], hole).crop((cx0, cy0, cx1, cy1))
+        remeasured = False
+        if filled:
+            tmp_img = f"_pe_fill_{i:02d}.png"
+            tmp_cut = f"_pe_recut_{i:02d}.png"
+            crop.save(run_dir / tmp_img)
+            rb = region.getbbox()
+            if rb:
+                nb = [((rb[0] + rb[2]) / 2) / crop.width,
+                      ((rb[1] + rb[3]) / 2) / crop.height,
+                      (rb[2] - rb[0]) / crop.width,
+                      (rb[3] - rb[1]) / crop.height]
+                try:
+                    sam2c.cutout({
+                        "dir": str(run_dir), "image": tmp_img,
+                        "output": tmp_cut,
+                        "borders": [{"bbox": nb, "positive_points": [],
+                                     "negative_points": []}],
+                        "padding_ratio": 0.02, "min_padding": 2,
+                        "mask_threshold": 0.5, "feather_radius": 0,
+                        "multimask": False, "crop_scale": 1.5,
+                        "refine": True, "fill_holes": True,
+                        "size_rules": [],
+                    })
+                    cut_path = run_dir / tmp_cut
+                    if cut_path.is_file():
+                        with Image.open(cut_path) as c:
+                            a2 = c.convert("RGBA").getchannel("A").point(
+                                lambda v: 255 if v > 0 else 0)
+                        if a2.size == crop.size and a2.getbbox():
+                            # 守门:复测 mask 必须罩住绝大部分可见本体,
+                            # 否则说明抓错目标,弃用复测结果
+                            vis_crop = alphas[i].crop((cx0, cy0, cx1, cy1))
+                            inter = sum(1 for v in ImageChops.darker(
+                                a2, vis_crop).getdata() if v)
+                            vis_ct = sum(1 for v in vis_crop.getdata() if v)
+                            if vis_ct and inter / vis_ct >= 0.7:
+                                region = a2
+                                remeasured = True
+                except RuntimeError:
+                    pass
+            (run_dir / tmp_img).unlink(missing_ok=True)
+            (run_dir / tmp_cut).unlink(missing_ok=True)
+
+        tile = crop.convert("RGBA")
+        tile.putalpha(region)
+        tight = region.getbbox()
+        if not tight:
+            rows.append({"panel_index": i, "file": "", "z": z_map[i],
+                         "filled": filled, "remeasured": remeasured,
+                         "hidden_ratio": hidden_ratio,
+                         "needs_review": True, "png_w": 0, "png_h": 0,
+                         "paste_x": 0, "paste_y": 0,
+                         "paste_w": 0, "paste_h": 0})
+            continue
+        tile = tile.crop(tight)
+        fname = f"p{i:02d}.png"
+        tile.save(out_dir / fname)
+        rec = {
+            "panel_index": i, "file": fname, "z": z_map[i],
+            "filled": filled, "remeasured": remeasured,
+            "hidden_ratio": hidden_ratio,
+            "needs_review": hidden_ratio > 0.6,
+            "png_w": tile.width, "png_h": tile.height,
+            "bbox": panels[i],
+            "paste_x": cx0 + tight[0], "paste_y": cy0 + tight[1],
+            "paste_w": tight[2] - tight[0], "paste_h": tight[3] - tight[1],
+        }
+        assets.append(rec)
+        rows.append(rec)
+
+    fields = ["panel_index", "file", "z", "filled", "remeasured",
+              "hidden_ratio", "needs_review", "png_w", "png_h",
+              "paste_x", "paste_y", "paste_w", "paste_h"]
+    manifest_path = out_dir / "manifest.csv"
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return {
+        "count": len(panels),
+        "ok": len(assets),
+        "filled_count": sum(1 for r in assets if r["filled"]),
+        "assets": sorted(assets, key=lambda a: a["panel_index"]),
+        "manifest": str(manifest_path),
+        "source_size": [sw, sh],
+        "elapsed_sec": round(time.time() - started, 1),
+    }
+
+
 def register_all() -> None:
     worker.register("hello", handle_hello)
     worker.register("text_back", handle_text_back)
@@ -1520,3 +2598,5 @@ def register_all() -> None:
     worker.register("sam2", handle_sam2)
     worker.register("icon_repair", handle_icon_repair)
     worker.register("icon_asset", handle_icon_asset)
+    worker.register("panel_asset", handle_panel_asset)
+    worker.register("panel_extract", handle_panel_extract)

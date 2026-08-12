@@ -162,7 +162,7 @@ export default function MidFillPanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              14
+              15
             </span>
             修补
           </span>
@@ -208,7 +208,7 @@ export default function MidFillPanel() {
           </Button>
           {!canRun ? (
             <span className="text-[12px] text-black/45">
-              请先完成第 13 步中景层破洞图
+              请先完成第 14 步中景层破洞图
             </span>
           ) : null}
         </div>

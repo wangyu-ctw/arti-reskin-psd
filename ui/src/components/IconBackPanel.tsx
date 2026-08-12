@@ -165,9 +165,9 @@ export default function IconBackPanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              9
+              10
             </span>
-            去icon
+            生成中景层
           </span>
           <div className="flex items-center gap-2">
             {iconBackStatus === 'done' ? (

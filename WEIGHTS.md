@@ -15,7 +15,9 @@
 | T5-XXL 文本编码 | `/workspace/models/FLUX.1-dev/t5xxl_fp16_merged.safetensors`(手动合并分片) | ~9G | `models/text_encoders/t5xxl_fp16.safetensors` | 在役 |
 | VAE | `/workspace/models/FLUX.1-dev/ae.safetensors` | 320M | `models/vae/ae.safetensors` | 在役 |
 | 去字 LoRA(2026-08-04 续训 step-1505) | `/workspace/outputs/text_back_20260804/step-1505.safetensors` | 1.2G | `models/loras/omnipsd_text_back.safetensors` | 在役(2026-08-04 上线) |
-| 去icon补洞 LoRA(Fill 范式,rank 32,3000 步) | `/workspace/outputs/icon_back_fill_20260804/pytorch_lora_weights.safetensors` | 172M | `models/loras/icon_back_fill.safetensors` | 在役(2026-08-04 上线) |
+| 去icon补洞 LoRA(Fill 范式,rank 32,3000 步) | `/workspace/outputs/icon_back_fill_20260804/pytorch_lora_weights.safetensors` | 172M | `models/loras/icon_back_fill.safetensors` | 在役·第 9 步(2026-08-04 上线) |
+| 中景修补 LoRA(mid_fill,icon_back 续训 3000→6000 步,1875 块中景洞团) | `/workspace/outputs/mid_fill_20260807/pytorch_lora_weights.safetensors` | 172M | `models/loras/mid_fill.safetensors` | 在役·第 14 步(2026-08-10 上线,A/B 幻觉少于 icon_back) |
+| panel 修补 LoRA(panel_fill,mid_fill 续训 6000→9000 步,1012 样本/2086 块剥洋葱数据) | `/workspace/outputs/panel_fill_20260807/pytorch_lora_weights.safetensors` | 172M | `models/loras/panel_fill.safetensors` | 在役·panel_extract 默认(2026-08-11 上线);checkpoint-6500~9000 可回退 |
 
 去字 LoRA 训练史:初版产物在 `/workspace/output/text_back/`(step-5500~7055,曾在役的 step-7055 可随时回退);
 2026-08-04 以 step-7055 为基础、用 301 对新 PSD 数据续训 5 轮(lr 2e-5,脚本 `/workspace/OmniPSD/scripts/train_text_back_20260804.sh`),
@@ -63,6 +65,13 @@ YOLO 为三模型注册表(2026-08-06 起):daemon 同时挂三个权重,检测�
 | YOLO 旧版(game0804 的训练起点) | `/workspace/ui_skin/pretrained/yolo/yolo_ui_element_best.pt` | 39M | 回退备份 |
 
 YOLO 训练产物区:`/workspace/outputs/yolo_train/<name>/weights/best.pt`(game0804_from_old 即本次)。
+
+panel 专项 YOLO(amodal 全貌 bbox,单类 panel;已注册为 daemon 的 "panel_amodal" 可按需调用,前端入口已撤——实测效果差于 game0804_p2 的 panel 类,提升需加新游戏数据):
+`/workspace/ui_skin/pretrained/yolo/yolo_panel_amodal_20260811_best.pt`(39M)。
+数据 `/workspace/inputs/panel_yolo_20260811/`(786 训练/90 验证,ansatsu holdout,每 PSD 三态图 full/mid/stack 共享 amodal 标签)。
+v1 默认超参 mAP50 0.552;v2(AdamW 5e-4+余弦退火+fliplr)mAP50 0.570 / mAP50-95 0.372,即当前在役版。
+两版都是 best 停在前几个 epoch、后续过拟合——瓶颈是训练集游戏风格多样性(泛化到全新游戏就这个水平),
+提升需加游戏而非调参。接入 yolod.sh 三模型注册表即可上线(未接,等验收)。
 
 ## 冷备通道(`text_back_cold`,diffsynth 直载,正常流程不触发)
 

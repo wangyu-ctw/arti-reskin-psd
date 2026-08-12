@@ -278,8 +278,23 @@ export default function SeedSeekPage() {
           const abort = new AbortController()
           currentRef.current = { seed, abort }
           try {
+            // fill_icon 与主流程去icon同口径:run 里有 panel_f.png 时
+            // 一并挖洞(mask_from 数组取 alpha 并集)
+            let fixed = m.fixed
+            if (task === 'fill_icon') {
+              try {
+                const { files } = (await (
+                  await fetch(`/api/runs/${row.runId}/files`)
+                ).json()) as { files: string[] }
+                if (files.includes('panel_f.png')) {
+                  fixed = { ...fixed, mask_from: ['icons.png', 'panel_f.png'] }
+                }
+              } catch {
+                /* 清单读取失败则维持单层 mask */
+              }
+            }
             const { task_id } = await submitTask(m.taskType, row.runId, {
-              ...m.fixed,
+              ...fixed,
               ...params,
               seed,
             })

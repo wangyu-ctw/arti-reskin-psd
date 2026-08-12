@@ -5,7 +5,7 @@ import { pickDetections } from '../lib/detection'
 import ZoomableCanvas from './ZoomableCanvas'
 
 /**
- * 第 13 步:中景层破洞图 = 第 9 步结果图挖掉 assets/bar/button 的 mask。
+ * 第 14 步:中景层破洞图 = 第 10 步结果图挖掉 assets/bar/button 的 mask。
  * 手动点"生成"才计算,不自动生成。
  */
 export default function MidHolePanel() {
@@ -34,7 +34,7 @@ export default function MidHolePanel() {
         <div className="flex items-center justify-between">
           <span className="text-[15px] font-bold">
             <span className="mr-2 inline-grid size-[26px] place-items-center rounded-full bg-[#e6f4ff] text-xs font-extrabold text-[#1677ff]">
-              13
+              14
             </span>
             中景层破洞图
           </span>
@@ -93,8 +93,8 @@ export default function MidHolePanel() {
           ) : null}
           <span className="px-2 text-[12px] text-black/45">
             {canRun
-              ? '点击右上角"生成"：第 9 步结果图减去已提取的 assets/bar/button 区域'
-              : '需要第 9 步完成，且 10~12 步至少提取过一层'}
+              ? '点击右上角"生成"：第 10 步结果图减去已提取的 assets/bar/button 区域'
+              : '需要第 10 步完成，且 11~13 步至少提取过一层'}
           </span>
         </div>
       )}

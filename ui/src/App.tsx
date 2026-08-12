@@ -7,11 +7,14 @@ import IconAnalysisPanel from './components/IconAnalysisPanel'
 import TextFrontPanel from './components/TextFrontPanel'
 import IconExtractPanel from './components/IconExtractPanel'
 import IconAssetPanel from './components/IconAssetPanel'
+import PanelFExtractPanel from './components/PanelFExtractPanel'
 import IconBackPanel from './components/IconBackPanel'
 import MidExtractPanel from './components/MidExtractPanel'
+import BarDecomposePanel from './components/BarDecomposePanel'
 import MidHolePanel from './components/MidHolePanel'
 import MidFillPanel from './components/MidFillPanel'
 import CompareSliderPanel from './components/CompareSliderPanel'
+import PanelExtractPanel from './components/PanelExtractPanel'
 import SeedSeekPage from './pages/SeedSeekPage'
 
 function App() {
@@ -50,16 +53,22 @@ function App() {
           <IconAssetPanel />
         </div>
         <div className="h-full w-110 shrink-0">
+          <PanelFExtractPanel />
+        </div>
+        <div className="h-full w-110 shrink-0">
           <IconBackPanel />
         </div>
         <div className="h-full w-110 shrink-0">
-          <MidExtractPanel category="assets" stepNo={10} title="提assets" />
+          <MidExtractPanel category="assets" stepNo={11} title="提assets" />
         </div>
         <div className="h-full w-110 shrink-0">
-          <MidExtractPanel category="button" stepNo={11} title="提button" />
+          <MidExtractPanel category="button" stepNo={12} title="提button" />
         </div>
         <div className="h-full w-110 shrink-0">
-          <MidExtractPanel category="bar" stepNo={12} title="提bar" />
+          <MidExtractPanel category="bar" stepNo={13} title="提bar" />
+        </div>
+        <div className="h-full w-110 shrink-0">
+          <BarDecomposePanel />
         </div>
         <div className="h-full w-110 shrink-0">
           <MidHolePanel />
@@ -69,6 +78,9 @@ function App() {
         </div>
         <div className="h-full w-110 shrink-0">
           <CompareSliderPanel />
+        </div>
+        <div className="h-full w-110 shrink-0">
+          <PanelExtractPanel />
         </div>
       </div>
     </main>

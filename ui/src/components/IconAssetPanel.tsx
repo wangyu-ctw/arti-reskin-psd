@@ -134,6 +134,7 @@ export default function IconAssetPanel() {
     iconAssetSummary,
     iconAssetItems,
     iconAssetSourceSize,
+    iconAssetTick,
     iconAssetUseRef,
     runAnalyzeGroups,
     runIconAsset,
@@ -246,7 +247,7 @@ export default function IconAssetPanel() {
                   it.members.map((m) => (
                     <img
                       key={`${it.slug}-${m.member}`}
-                      src={`/api/runs/${runInfo?.run_id}/files/icon_assets/${it.file}`}
+                      src={`/api/runs/${runInfo?.run_id}/files/icon_assets/${it.file}?t=${iconAssetTick}`}
                       alt={it.slug}
                       title={`${it.slug} #${m.member}`}
                       className="absolute"

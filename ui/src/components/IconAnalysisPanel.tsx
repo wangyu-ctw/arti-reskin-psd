@@ -86,9 +86,7 @@ export default function IconAnalysisPanel() {
     iconAnalysisStatus,
     iconAnalysisError,
     analyzedIcons,
-    iconClampInfo,
     runAnalyzeIcons,
-    clearNegativePoints,
   } = useDetectionStore()
 
   // 与第 5 步/分析逻辑同口径:不计 discard 的审计记录
@@ -131,22 +129,9 @@ export default function IconAnalysisPanel() {
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="text-[13px] font-bold">分析结果</span>
-            <div className="flex items-center gap-2">
-              {iconClampInfo ? (
-                <span className="text-[11px] text-black/45">{iconClampInfo}</span>
-              ) : null}
-              <Button
-                size="small"
-                danger
-                disabled={!analyzedIcons.some((a) => a.negative_points.length > 0)}
-                onClick={clearNegativePoints}
-              >
-                一键清除负点
-              </Button>
-              <Button size="small" onClick={() => setViewerOpen(true)}>
-                查看
-              </Button>
-            </div>
+            <Button size="small" onClick={() => setViewerOpen(true)}>
+              查看
+            </Button>
           </div>
           {analyzedIcons.map((icon) => (
             <div
@@ -157,14 +142,22 @@ export default function IconAnalysisPanel() {
                 <span className="min-w-0 truncate text-[13px]" title={icon.description}>
                   #{icon.index} {icon.description}
                 </span>
-                <span className="shrink-0 text-[11px] text-black/45">
+                <span className="flex shrink-0 items-center gap-1 text-[11px] text-black/45">
+                  {icon.has_overflow_glow === undefined ? null : icon.has_overflow_glow ? (
+                    <span className="rounded bg-[#fff7e6] px-1 font-bold text-[#d46b08]">
+                      四周有光效
+                    </span>
+                  ) : (
+                    <span className="rounded bg-neutral-100 px-1">无包裹光效</span>
+                  )}
                   正点 {icon.positive_points.length} · 负点 {icon.negative_points.length}
                 </span>
               </div>
             </div>
           ))}
           <div className="mt-1 text-center text-[11px] text-black/45">
-            下一步提icon将使用检测框原值 + 以上正负点
+            下一步提icon将使用检测框原值 + 以上正负点;标"四周有光效"的
+            icon 提取时正负点同时采纳
           </div>
         </div>
       ) : (

@@ -31,6 +31,8 @@ export type TaskType =
   | 'sam2'
   | 'icon_repair'
   | 'icon_asset'
+  | 'panel_asset'
+  | 'panel_extract'
 
 async function toJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
