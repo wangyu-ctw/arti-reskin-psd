@@ -13,6 +13,7 @@ function SettingsPopover() {
     textBackPrompt,
     textBackSeed,
     textBackSteps,
+    textBackGuidance,
     textBackProtect,
     textBackProtectGrow,
     setField,
@@ -58,6 +59,20 @@ function SettingsPopover() {
                 onChange={(v) => setField('textBackSeed', v ?? 5)}
                 min={0}
                 precision={0}
+              />
+            </div>
+            <div>
+              <div className="mb-1 text-[13px] font-bold">guidance</div>
+              <div className="mb-1 text-[11px] leading-snug text-black/40">
+                提示词影响强度:越高越听提示词,越低越贴原图(默认 1.0)
+              </div>
+              <InputNumber
+                className="w-full"
+                value={textBackGuidance}
+                onChange={(v) => setField('textBackGuidance', v ?? 1.0)}
+                min={0}
+                max={10}
+                step={0.1}
               />
             </div>
           </div>

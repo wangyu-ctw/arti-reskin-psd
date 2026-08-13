@@ -544,17 +544,19 @@ export async function recomposeDecomposedBar(
   )
   // 中轴线配准:工作坐标系里(竖排图已转置)三段的 bar 一律纵向,
   // 每个物体的中轴线 = alpha 包围盒的 x 中心;以底板为基准(缺席时
-  // 依次退到边框/填充),边框与填充平移对轴,进度方向(y)不动
+  // 依次退到边框/填充),边框与填充平移对轴,进度方向(y)不动。
+  // 跨度统计与落盘紧裁同口径:α≥64 且该列 ≥2 个有效像素——
+  // 色键残雾会把跨度撑满整段,让所有层的中心都变成"段中央",配准失效
   const xSpan = layers.map((ld) => {
-    let x0 = T
-    let x1 = -1
+    const colCnt = new Array<number>(T).fill(0)
     for (let y = 0; y < H; y++)
       for (let x = 0; x < T; x++)
-        if (ld.data[(y * T + x) * 4 + 3] > 8) {
-          if (x < x0) x0 = x
-          if (x > x1) x1 = x
-        }
-    return x1 < 0 ? null : { x0, x1 }
+        if (ld.data[(y * T + x) * 4 + 3] >= 64) colCnt[x]++
+    let x0 = 0
+    let x1 = T - 1
+    while (x0 < T && colCnt[x0] < 2) x0++
+    while (x1 >= 0 && colCnt[x1] < 2) x1--
+    return x1 < x0 ? null : { x0, x1 }
   })
   const ref = xSpan[2] ?? xSpan[0] ?? xSpan[1]
   const refCenter = ref ? (ref.x0 + ref.x1) / 2 : T / 2
@@ -608,16 +610,22 @@ export async function extractDecomposedLayers(
     const ld = rows ? transposeImageData(layers[k]) : layers[k]
     const w = ld.width
     const h = ld.height
-    let x0 = w, y0 = h, x1 = -1, y1 = -1
+    // 紧裁去噪:只统计较实的像素(α≥64),且行/列至少要有 2 个才算数——
+    // 排除色键残雾和孤立噪点把包围盒撑大(留白多了三层就对不上)
+    const colCnt = new Array<number>(w).fill(0)
+    const rowCnt = new Array<number>(h).fill(0)
     for (let y = 0; y < h; y++)
       for (let x = 0; x < w; x++)
-        if (ld.data[(y * w + x) * 4 + 3] > 8) {
-          if (x < x0) x0 = x
-          if (y < y0) y0 = y
-          if (x > x1) x1 = x
-          if (y > y1) y1 = y
+        if (ld.data[(y * w + x) * 4 + 3] >= 64) {
+          colCnt[x]++
+          rowCnt[y]++
         }
-    if (x1 < 0) continue // 空层(如无 border):不生成 PNG
+    let x0 = 0, x1 = w - 1, y0 = 0, y1 = h - 1
+    while (x0 < w && colCnt[x0] < 2) x0++
+    while (x1 >= 0 && colCnt[x1] < 2) x1--
+    while (y0 < h && rowCnt[y0] < 2) y0++
+    while (y1 >= 0 && rowCnt[y1] < 2) y1--
+    if (x1 < x0 || y1 < y0) continue // 空层(如无 border):不生成 PNG
     const cw = x1 - x0 + 1
     const ch = y1 - y0 + 1
     const full = document.createElement('canvas')

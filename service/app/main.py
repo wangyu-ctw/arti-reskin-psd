@@ -82,7 +82,10 @@ def list_run_files(run_id: str):
         run_dir = storage.get_run_dir(run_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
-    return {"files": sorted(p.name for p in run_dir.iterdir() if p.is_file())}
+    # 递归列出(含子目录,如 bar/),返回相对路径
+    return {"files": sorted(
+        str(p.relative_to(run_dir)) for p in run_dir.rglob("*") if p.is_file()
+    )}
 
 
 @app.get("/runs/{run_id}/files/{filename:path}")
@@ -102,17 +105,21 @@ def get_run_file(run_id: str, filename: str):
     return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
-@app.post("/runs/{run_id}/files/{filename}")
+@app.post("/runs/{run_id}/files/{filename:path}")
 async def put_run_file(run_id: str, filename: str, request: Request):
-    """把请求体原样写入 run 目录下的文件(存在则覆盖),如前端回传 structure1.json。"""
+    """把请求体原样写入 run 目录下的文件(存在则覆盖),如前端回传 structure1.json。
+    支持一层子目录(如 bar/xxx.png,13+ 步产物集中存放),自动建目录。"""
     try:
         run_dir = storage.get_run_dir(run_id).resolve()
     except ValueError as e:
         raise HTTPException(404, str(e))
     path = (run_dir / filename).resolve()
-    # 防目录穿越:必须还在 run 目录内,且只允许写直接子文件
-    if path.parent != run_dir:
-        raise HTTPException(403, "filename must be a direct child of run dir")
+    # 防目录穿越:必须还在 run 目录内,且最多一层子目录
+    if not str(path).startswith(str(run_dir) + "/"):
+        raise HTTPException(403, "path escapes run dir")
+    if path.parent != run_dir and path.parent.parent != run_dir:
+        raise HTTPException(403, "at most one subdirectory level allowed")
+    path.parent.mkdir(parents=True, exist_ok=True)
     body = await request.body()
     if not body:
         raise HTTPException(400, "empty body")

@@ -2362,6 +2362,8 @@ def handle_panel_extract(payload: dict) -> dict:
     payload:
         run_id / dir   二选一
         panels         必填 [[cx,cy,w,h],...](归一化)
+        z_order        可选,与 panels 对齐的层级数组(越大越上层,如第 16 步
+                       审核结果);缺席时按几何规则内算
         image          源图,默认 mid_fill.png
         lora           默认 panel_fill.safetensors(传空串禁用)
         seed/steps/guidance      fill 参数,默认 9/20/30
@@ -2425,8 +2427,13 @@ def handle_panel_extract(payload: dict) -> dict:
             a = a.resize((sw, sh), Image.Resampling.NEAREST)
         alphas.append(a)
 
-    # ② z 序与上层遮挡
-    z_map = _z_order_extract(rects)
+    # ② z 序与上层遮挡:payload.z_order(如第 16 步 VL 审核的层级)优先,
+    # 缺席时按几何规则内算(包含→内者在上,相交→面积小者在上)
+    z_payload = payload.get("z_order")
+    if z_payload and len(z_payload) == len(rects):
+        z_map = [int(v) for v in z_payload]
+    else:
+        z_map = _z_order_extract(rects)
     out_dir = run_dir / "panel_extract"
     out_dir.mkdir(exist_ok=True)
     for old_f in out_dir.glob("p*.png"):
@@ -2586,6 +2593,138 @@ def handle_panel_extract(payload: dict) -> dict:
     }
 
 
+def handle_panel_peel(payload: dict) -> dict:
+    """第 17 步"分层提取":拆-补-拆-补 剥洋葱,按 z 层整层出图。
+
+    以第 16 步审核的层级为准,从最上层开始:
+      拆 z_k :SAM2 按该层全部 panel 框在**当前工作图**上抠出
+              → panel_layers/z<k>.png(整层一张 RGBA);
+      补下层 :工作图上把 z_k 的 alpha 挖洞,flux_fill(panel_fill LoRA)
+              原位补全 → 新工作图(下层被压住的部分被补完整),继续拆下一层。
+    最底层拆完不再补。每个 panel 的细拆后续另做。
+
+    payload:
+        run_id / dir   二选一
+        panels         必填 [[cx,cy,w,h],...](归一化)
+        z_order        与 panels 对齐的层级数组(越大越上层);缺席时几何内算
+        image          源图,默认 mid_fill.png
+        lora           默认 panel_fill.safetensors(空串禁用)
+        seed/steps/guidance   fill 参数,默认 9/20/30
+        grow/blur      洞外扩/羽化 px,默认 4/2
+        prompt         补洞提示词,默认 DEFAULT_RESIDUAL_FILL_PROMPT
+        padding_ratio/min_padding/mask_threshold/feather_radius/
+        crop_scale/refine/multimask/fill_holes   拆(SAM2)参数,默认同第 17 步旧版
+    输出:panel_layers/z<k>.png 逐层 RGBA、stage_after_z<k>.png 补后工作图、
+         manifest.json(levels: [{z, file, count}])
+    """
+    if payload.get("dir"):
+        run_dir = Path(payload["dir"])
+    else:
+        run_dir = storage.get_run_dir(payload["run_id"])
+    panels = payload.get("panels")
+    if not panels:
+        raise ValueError("payload.panels must be a non-empty array")
+    src_path = run_dir / (payload.get("image") or "mid_fill.png")
+    if not src_path.is_file():
+        raise FileNotFoundError(f"input not found: {src_path}")
+    lora = payload.get("lora", "panel_fill.safetensors") or None
+    seed = int(payload.get("seed", 9))
+    steps = int(payload.get("steps", 20))
+    guidance = float(payload.get("guidance", 30.0))
+    grow = int(payload.get("grow", 4))
+    blur = float(payload.get("blur", 2))
+    prompt = payload.get("prompt") or DEFAULT_RESIDUAL_FILL_PROMPT
+    # 拆(SAM2)参数,全部可配
+    sam_params = {
+        "padding_ratio": float(payload.get("padding_ratio", 0.02)),
+        "min_padding": float(payload.get("min_padding", 2)),
+        "mask_threshold": float(payload.get("mask_threshold", 0.5)),
+        "feather_radius": float(payload.get("feather_radius", 0)),
+        "multimask": bool(payload.get("multimask", False)),
+        "crop_scale": float(payload.get("crop_scale", 1.5)),
+        "refine": bool(payload.get("refine", True)),
+        "fill_holes": bool(payload.get("fill_holes", True)),
+    }
+
+    with Image.open(src_path) as im:
+        work = im.convert("RGB")
+    sw, sh = work.size
+
+    def _rect(b):
+        return (max(0, int((b[0] - b[2] / 2) * sw)),
+                max(0, int((b[1] - b[3] / 2) * sh)),
+                min(sw, int(math.ceil((b[0] + b[2] / 2) * sw))),
+                min(sh, int(math.ceil((b[1] + b[3] / 2) * sh))))
+
+    z_payload = payload.get("z_order")
+    if z_payload and len(z_payload) == len(panels):
+        z_map = [int(v) for v in z_payload]
+    else:
+        z_map = _z_order_extract([_rect(b) for b in panels])
+
+    out_dir = run_dir / "panel_layers"
+    out_dir.mkdir(exist_ok=True)
+    for old_f in out_dir.glob("*.png"):
+        old_f.unlink()
+
+    started = time.time()
+    levels = sorted(set(z_map), reverse=True)  # 顶层在前
+    results = []
+    for pos, level in enumerate(levels):
+        idxs = [i for i, z in enumerate(z_map) if z == level]
+        # 拆:当前工作图落盘,整层 SAM2(该层全部框合并输出一张 RGBA)
+        work_name = f"_peel_work_{level}.png"
+        work.save(run_dir / work_name)
+        layer_rel = f"panel_layers/z{level}.png"
+        sam2c.cutout({
+            "dir": str(run_dir), "image": work_name, "output": layer_rel,
+            "borders": [{"bbox": panels[i], "positive_points": [],
+                         "negative_points": []} for i in idxs],
+            **sam_params, "size_rules": [],
+        })
+        (run_dir / work_name).unlink(missing_ok=True)
+        with Image.open(run_dir / layer_rel) as im:
+            alpha = im.convert("RGBA").getchannel("A").point(
+                lambda v: 255 if v > 0 else 0)
+        if alpha.size != (sw, sh):
+            alpha = alpha.resize((sw, sh), Image.Resampling.NEAREST)
+        results.append({"z": level, "file": layer_rel, "count": len(idxs)})
+
+        # 补:非最底层时,把本层挖掉的洞 fill 补全,得到下一轮工作图
+        if pos != len(levels) - 1 and alpha.getbbox():
+            hole = alpha
+            if grow > 0:
+                hole = hole.filter(ImageFilter.MaxFilter(2 * grow + 1))
+            soft = hole.filter(ImageFilter.GaussianBlur(blur)) \
+                if blur > 0 else hole
+            img_name = comfy.place_input_pil(work, prefix=f"peel_{level}_")
+            mask_name = comfy.place_input_pil(
+                soft.convert("RGB"), prefix=f"peel_mask_{level}_")
+            entry = comfy.run_workflow(build_flux_fill_workflow(
+                image_name=img_name, mask_name=mask_name,
+                prompt=prompt,
+                seed=seed, steps=steps,
+                width=sw, height=sh,
+                guidance=guidance, lora_name=lora))
+            images = comfy.output_image_paths(entry)
+            if not images:
+                raise RuntimeError(f"flux_fill 无输出(补 z{level} 下层时)")
+            with Image.open(images[0]) as g:
+                gen = g.convert("RGB")
+                if gen.size != (sw, sh):
+                    gen = gen.resize((sw, sh), Image.Resampling.LANCZOS)
+            gen, _ = _match_colors_to_input(gen, work, soft.convert("RGB"))
+            work = Image.composite(gen, work, soft)
+            work.save(out_dir / f"stage_after_z{level}.png")
+
+    import json as _json
+    manifest = {"levels": results, "count": len(panels),
+                "elapsed_sec": round(time.time() - started, 1)}
+    (out_dir / "manifest.json").write_text(
+        _json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    return manifest
+
+
 def register_all() -> None:
     worker.register("hello", handle_hello)
     worker.register("text_back", handle_text_back)
@@ -2600,3 +2739,4 @@ def register_all() -> None:
     worker.register("icon_asset", handle_icon_asset)
     worker.register("panel_asset", handle_panel_asset)
     worker.register("panel_extract", handle_panel_extract)
+    worker.register("panel_peel", handle_panel_peel)

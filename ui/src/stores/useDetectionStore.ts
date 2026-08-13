@@ -12,6 +12,7 @@ import {
   detectOverlay,
   humanizeError,
   pickDetections,
+  type DetectionItem,
   type StructuredResult,
 } from '../lib/detection'
 import {
@@ -30,6 +31,7 @@ import { analyzeIconGroups, type IconGroup } from '../lib/iconGroups'
 import { analyzeCutoutFixes, fetchImageDataUrl } from '../lib/iconRefine'
 import { bboxIoU, cropBarOnGreen, cropRect, extractDecomposedLayers, generateBarDecompose, groupBars, isOverlayOnBar, listBars, probeLinesToBBoxes, unionBBoxes, type BarGroup, type BarOrientation, type DecomposeLayerName } from '../lib/barDecompose'
 import { annotateLayer, bboxToCanvas, computePanelLayers, fitToPresetCanvas, generatePanelLayer, padToCanvas, type CanvasFit } from '../lib/panelGen'
+import { auditPanels, drawAuditOverlay, roughPanelZ, type PanelAuditDeletion, type PanelAuditItem } from '../lib/panelAudit'
 
 export const DEFAULT_TEXT_BACK_PROMPT = stepDefaults.textBack.prompt
 
@@ -123,6 +125,7 @@ interface DetectionState {
   textBackPrompt: string
   textBackSeed: number
   textBackSteps: number
+  textBackGuidance: number
   // 保护合成:只有 YOLO text 框内取重生成像素,其余保留原图,icon 不可能被误删
   textBackProtect: boolean
   textBackProtectGrow: number
@@ -204,6 +207,13 @@ interface DetectionState {
   midStatus: Record<MidKey, TextBackStatus>
   midImageUrl: Record<MidKey, string>
   midError: Record<MidKey, string>
+  // 第 13 步提bar:被拿去补 bar 的覆盖物标记(哪个元素补进了哪个 bar)
+  barConsumedOverlays: {
+    bar_index: number
+    category: string
+    index: number
+    bbox: number[]
+  }[]
   // 第 12+ 步:bar分解(三段式拆解,chroma green;先 VL 分组再逐代表分解)
   barDecomposeModel: string
   barDecomposeSystemPrompt: string
@@ -311,6 +321,38 @@ interface DetectionState {
     paste_h: number
   }[]
   panelExtractSourceSize: [number, number] | null
+  // 第 16 步(新):panel修正(Gemini VL 审核检测 panel:纠删补/层级/分类/透明)
+  panelAuditModel: string
+  panelAuditSystemPrompt: string
+  panelAuditUserPrompt: string
+  panelAuditStatus: TextBackStatus
+  panelAuditError: string
+  panelAuditItems: PanelAuditItem[]
+  panelAuditDeleted: PanelAuditDeletion[]
+  panelAuditImageUrl: string
+  // 第 17 步:分层提取(拆-补-拆 剥洋葱,按 16 步层级整层出图)
+  panelPeelParams: {
+    seed: number
+    steps: number
+    guidance: number
+    grow: number
+    blur: number
+    lora: string
+    prompt: string
+    paddingRatio: number
+    minPadding: number
+    maskThreshold: number
+    featherRadius: number
+    cropScale: number
+    refine: boolean
+    multimask: boolean
+    fillHoles: boolean
+  }
+  panelPeelStatus: TextBackStatus
+  panelPeelError: string
+  panelPeelLevels: { z: number; file: string; count: number }[]
+  panelPeelTick: number
+  panelPeelElapsed: number
   // 第 15 步:前中景对比(6/8/10/11/12/14 图层本地拼合,与原图滑杆对比,不上传)
   compareStatus: TextBackStatus
   compareImageUrl: string
@@ -371,6 +413,8 @@ interface DetectionState {
   runPanelGen: () => Promise<void>
   runPanelAsset: () => Promise<void>
   runPanelExtract: () => Promise<void>
+  runPanelAudit: () => Promise<void>
+  runPanelPeel: () => Promise<void>
   submit: () => Promise<void>
   cancel: () => void
   clearOutput: () => void
@@ -538,7 +582,9 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   textBackPrompt: stepDefaults.textBack.prompt,
   textBackSeed: stepDefaults.textBack.seed,
   textBackSteps: stepDefaults.textBack.steps,
-  textBackProtect: true,
+  textBackGuidance: stepDefaults.textBack.guidance,
+  // 保护合成默认关闭(需要时在第 2 步设置里手动开)
+  textBackProtect: false,
   textBackProtectGrow: 8,
   textBackStatus: 'idle',
   textBackImageUrl: '',
@@ -610,6 +656,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   barDecomposeSystemPrompt: stepDefaults.barDecompose.systemPrompt,
   barDecomposeSystemPromptV: stepDefaults.barDecompose.systemPromptV,
   barDecomposeUserPrompt: stepDefaults.barDecompose.userPrompt,
+  barConsumedOverlays: [],
   barDecomposeStatus: 'idle',
   barDecomposeError: '',
   barDecomposeItems: [],
@@ -668,6 +715,20 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   panelExtractTick: 0,
   panelExtractItems: [],
   panelExtractSourceSize: null,
+  panelAuditModel: stepDefaults.panelAudit.model,
+  panelAuditSystemPrompt: stepDefaults.panelAudit.systemPrompt,
+  panelAuditUserPrompt: stepDefaults.panelAudit.userPrompt,
+  panelAuditStatus: 'idle',
+  panelAuditError: '',
+  panelAuditItems: [],
+  panelAuditDeleted: [],
+  panelAuditImageUrl: '',
+  panelPeelParams: { ...stepDefaults.panelPeel },
+  panelPeelStatus: 'idle',
+  panelPeelError: '',
+  panelPeelLevels: [],
+  panelPeelTick: 0,
+  panelPeelElapsed: 0,
   compareStatus: 'idle',
   compareImageUrl: '',
   compareError: '',
@@ -723,6 +784,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       midFillStatus: 'idle',
       midFillImageUrl: '',
       midFillError: '',
+      barConsumedOverlays: [],
       barDecomposeStatus: 'idle',
       barDecomposeError: '',
       barDecomposeItems: [],
@@ -735,6 +797,15 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       panelExtractInfo: '',
       panelExtractItems: [],
       panelExtractSourceSize: null,
+      panelAuditStatus: 'idle',
+      panelAuditError: '',
+      panelAuditItems: [],
+      panelAuditDeleted: [],
+      panelAuditImageUrl: '',
+      panelPeelStatus: 'idle',
+      panelPeelError: '',
+      panelPeelLevels: [],
+      panelPeelTick: 0,
       compareStatus: 'idle',
       compareImageUrl: '',
       compareError: '',
@@ -792,10 +863,13 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       // 第 12+ 步 bar 分解结果(bar_decompose.json)
       let restoredBarItems: DetectionState['barDecomposeItems'] = []
       let restoredBarGroups: BarGroup[] = []
-      if (has('bar_decompose.json')) {
+      const barMetaName = has('bar/bar_decompose.json')
+        ? 'bar/bar_decompose.json'
+        : has('bar_decompose.json') ? 'bar_decompose.json' : ''
+      if (barMetaName) {
         try {
           const meta2 = (await (
-            await fetch(fileUrl('bar_decompose.json'))
+            await fetch(fileUrl(barMetaName))
           ).json()) as {
             groups?: BarGroup[]
             items?: {
@@ -817,6 +891,54 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         } catch {
           restoredBarItems = []
           restoredBarGroups = []
+        }
+      }
+
+      // 第 16 步 panel 审核结果(panel_audit.json)
+      let restoredAudit: PanelAuditItem[] = []
+      let restoredAuditDeleted: PanelAuditDeletion[] = []
+      let restoredAuditImage = ''
+      if (has('panel_audit.json') && has('mid_fill.png')) {
+        try {
+          const meta3 = (await (
+            await fetch(fileUrl('panel_audit.json'))
+          ).json()) as { panels?: PanelAuditItem[]; deleted?: PanelAuditDeletion[] }
+          restoredAudit = meta3.panels ?? []
+          restoredAuditDeleted = meta3.deleted ?? []
+          if (restoredAudit.length) {
+            restoredAuditImage = await drawAuditOverlay(
+              fileUrl('mid_fill.png'), restoredAudit,
+            )
+          }
+        } catch {
+          restoredAudit = []
+          restoredAuditImage = ''
+        }
+      }
+
+      // 第 13 步补 bar 标记(bar/consumed_overlays.json)
+      let restoredConsumed: DetectionState['barConsumedOverlays'] = []
+      if (has('bar/consumed_overlays.json')) {
+        try {
+          const metaC = (await (
+            await fetch(fileUrl('bar/consumed_overlays.json'))
+          ).json()) as { consumed?: DetectionState['barConsumedOverlays'] }
+          restoredConsumed = metaC.consumed ?? []
+        } catch {
+          restoredConsumed = []
+        }
+      }
+
+      // 第 17 步分层提取结果(panel_layers/manifest.json)
+      let restoredPeel: { z: number; file: string; count: number }[] = []
+      if (has('panel_layers/manifest.json')) {
+        try {
+          const meta4 = (await (
+            await fetch(fileUrl('panel_layers/manifest.json'))
+          ).json()) as { levels?: { z: number; file: string; count: number }[] }
+          restoredPeel = (meta4.levels ?? []).filter((l) => has(l.file))
+        } catch {
+          restoredPeel = []
         }
       }
 
@@ -862,6 +984,16 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         barGroupStatus: restoredBarGroups.length ? 'done' : 'idle',
         barGroupError: '',
         barDecomposeBusy: [],
+        panelAuditStatus: restoredAudit.length ? 'done' : 'idle',
+        panelAuditError: '',
+        panelAuditItems: restoredAudit,
+        panelAuditDeleted: restoredAuditDeleted,
+        panelAuditImageUrl: restoredAuditImage,
+        barConsumedOverlays: restoredConsumed,
+        panelPeelStatus: restoredPeel.length ? 'done' : 'idle',
+        panelPeelError: '',
+        panelPeelLevels: restoredPeel,
+        panelPeelTick: Date.now(),
         iconGroupStatus: 'idle', iconGroupError: '', iconGroups: null, iconAssetStatus: 'idle', iconAssetError: '', iconAssetSummary: '', iconAssetItems: [], iconAssetSourceSize: null,
         iconStatus: has('icons.png') ? 'done' : 'idle',
         iconImageUrl: has('icons.png') ? fileUrl('icons.png') : '',
@@ -935,6 +1067,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         prompt: textBackPrompt.trim() || DEFAULT_TEXT_BACK_PROMPT,
         seed: textBackSeed,
         steps: textBackSteps,
+        guidance: get().textBackGuidance,
         protect: get().textBackProtect,
         protect_grow: get().textBackProtectGrow,
       })
@@ -1460,17 +1593,25 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       // 提bar:压在 bar 上的 icon/assets/panel 也作为独立 border 传给 SAM2
       // (各自的框出各自的干净 mask,与 bar mask 合并),配合 restore_from
       // 把像素从去字图还原,覆盖物随 bar 完整进入提取层
-      // panel_f 只要与 bar 有任意叠压就并入(anyOverlap),其余类走比例判定
-      const overlays =
-        cat === 'bar'
-          ? (['icon', 'assets', 'panel', 'panel_f'] as const).flatMap((k) =>
-              pickDetections(structuredResult, k).filter((d) =>
-                borders.some((b) =>
-                  isOverlayOnBar(b.bbox, d, k === 'panel_f'),
-                ),
-              ),
+      // panel_f 只要与 bar 有任意叠压就并入(anyOverlap),其余类走比例判定。
+      // 同时记录归属:哪个元素被补进了哪个 bar(下标按各自 pickDetections 序)
+      const consumed: DetectionState['barConsumedOverlays'] = []
+      const overlays: DetectionItem[] = []
+      if (cat === 'bar') {
+        for (const k of ['icon', 'assets', 'panel', 'panel_f'] as const) {
+          pickDetections(structuredResult, k).forEach((d, di) => {
+            const hit = borders.findIndex((b) =>
+              isOverlayOnBar(b.bbox, d, k === 'panel_f'),
             )
-          : []
+            if (hit >= 0) {
+              overlays.push(d)
+              consumed.push({
+                bar_index: hit, category: k, index: di, bbox: d.bbox,
+              })
+            }
+          })
+        }
+      }
       const { task_id } = await submitTask('sam2', runInfo.run_id, {
         image,
         output: `${cat}.png`,
@@ -1496,7 +1637,18 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
           ...get().midImageUrl,
           [cat]: `/api/runs/${runInfo.run_id}/files/${cat}.png?t=${Date.now()}`,
         },
+        ...(cat === 'bar' ? { barConsumedOverlays: consumed } : {}),
       })
+      if (cat === 'bar') {
+        // 标记落盘:第 16 步审核和恢复记录都要用
+        fetch(`/api/runs/${runInfo.run_id}/files/bar/consumed_overlays.json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ consumed }),
+        }).catch(() => {
+          /* 静默同步,失败仅跳过 */
+        })
+      }
     } catch (error) {
       if (get().runInfo?.run_id !== runInfo.run_id) return
       set({
@@ -1632,7 +1784,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         // (后端任务队列是 FIFO 单工位,并行提交会自动排队,无碍)
         let probeBoxes: number[][] = []
         try {
-          const probeName = `_bar_probe_${t.index}.png`
+          const probeName = `bar/_bar_probe_${t.index}.png`
           const blob = await (await fetch(barDataUrl)).blob()
           await fetch(`${base}/${probeName}`, {
             method: 'POST',
@@ -1641,7 +1793,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
           })
           const probeTask = await submitTask('yolo', runInfo.run_id, {
             image: probeName,
-            txt_output: `_bar_probe_${t.index}.txt`,
+            txt_output: `bar/_bar_probe_${t.index}.txt`,
           })
           const probeRes = (await waitTask(probeTask.task_id)) as {
             lines?: string[]
@@ -1686,7 +1838,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         // 静默上传 pod
         try {
           const blob = await (await fetch(url)).blob()
-          await fetch(`${base}/bar_decompose_${t.index}.png`, {
+          await fetch(`${base}/bar/bar_decompose_${t.index}.png`, {
             method: 'POST',
             headers: { 'Content-Type': 'image/png' },
             body: blob,
@@ -1700,7 +1852,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
           const layerPngs = await extractDecomposedLayers(url, t.orientation)
           const layerFiles: Partial<Record<DecomposeLayerName, string>> = {}
           for (const L of layerPngs) {
-            const fname = `bar_${t.index}_${L.name}.png`
+            const fname = `bar/bar_${t.index}_${L.name}.png`
             const blob = await (await fetch(L.dataUrl)).blob()
             await fetch(`${base}/${fname}`, {
               method: 'POST',
@@ -1739,7 +1891,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         }
       })
       // 元数据落盘(图片已逐张上传),恢复记录时可复用
-      fetch(`${base}/bar_decompose.json`, {
+      fetch(`${base}/bar/bar_decompose.json`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1747,7 +1899,7 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
           items: get().barDecomposeItems.map((it) => ({
             index: it.index,
             orientation: it.orientation,
-            file: `bar_decompose_${it.index}.png`,
+            file: `bar/bar_decompose_${it.index}.png`,
             layers: it.layers ?? {},
           })),
         }),
@@ -1987,15 +2139,126 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
     }
   },
 
-  runPanelExtract: async () => {
-    const { runInfo, structuredResult, midFillStatus, panelExtractStatus } = get()
+  runPanelAudit: async () => {
+    const { runInfo, structuredResult, midFillStatus, apiKey } = get()
+    if (!runInfo || midFillStatus !== 'done') return
+    if (get().panelAuditStatus === 'running') return
+    // 被第 13 步拿去补 bar 的 panel 不再参与审核(已随 bar 层走)
+    const consumedPanels = new Set(
+      get().barConsumedOverlays
+        .filter((c) => c.category === 'panel')
+        .map((c) => c.index),
+    )
     const panels = pickDetections(structuredResult, 'panel')
-    if (!runInfo || midFillStatus !== 'done' || panels.length === 0) return
+      .map((p, index) => ({ index, bbox: p.bbox }))
+      .filter((p) => !consumedPanels.has(p.index))
+    if (panels.length === 0) return
+    if (!apiKey.trim()) {
+      set({ panelAuditStatus: 'error',
+            panelAuditError: '请先在第 2 步填写 OpenRouter API Key' })
+      return
+    }
+    set({ panelAuditStatus: 'running', panelAuditError: '' })
+    try {
+      const base = `/api/runs/${runInfo.run_id}/files`
+      const midFillUrl = `${base}/mid_fill.png?t=${Date.now()}`
+      const imageDataUrl = await fetchImageDataUrl(midFillUrl)
+      // 粗排层级(包含→内者在上,相交→小者在上),给 Gemini 当初值
+      const zs = roughPanelZ(panels.map((p) => p.bbox))
+      const { panels: items, deleted } = await auditPanels({
+        apiKey: apiKey.trim(),
+        model: get().panelAuditModel.trim(),
+        temperature: stepDefaults.panelAudit.temperature,
+        systemPrompt: get().panelAuditSystemPrompt,
+        userPrompt: get().panelAuditUserPrompt,
+        imageDataUrl,
+        panels: panels.map((p, k) => ({ index: p.index, bbox: p.bbox, z: zs[k] })),
+      })
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      const overlay = await drawAuditOverlay(midFillUrl, items)
+      set({
+        panelAuditStatus: 'done',
+        panelAuditItems: items,
+        panelAuditDeleted: deleted,
+        panelAuditImageUrl: overlay,
+      })
+      // 结果落盘,恢复记录可复用
+      fetch(`${base}/panel_audit.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ panels: items, deleted }),
+      }).catch(() => {
+        /* 静默同步,失败仅跳过 */
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelAuditStatus: 'error',
+        panelAuditError: error instanceof Error ? error.message : '审核失败',
+      })
+    }
+  },
+
+  runPanelPeel: async () => {
+    const { runInfo, midFillStatus } = get()
+    const audit = get().panelAuditItems
+    if (!runInfo || midFillStatus !== 'done') return
+    if (get().panelAuditStatus !== 'done' || audit.length === 0) return
+    if (get().panelPeelStatus === 'running') return
+    set({ panelPeelStatus: 'running', panelPeelError: '' })
+    try {
+      const pp = get().panelPeelParams
+      const task = await submitTask('panel_peel', runInfo.run_id, {
+        panels: audit.map((a) => a.bbox),
+        z_order: audit.map((a) => a.z),
+        seed: pp.seed,
+        steps: pp.steps,
+        guidance: pp.guidance,
+        grow: pp.grow,
+        blur: pp.blur,
+        lora: pp.lora,
+        prompt: pp.prompt,
+        padding_ratio: pp.paddingRatio,
+        min_padding: pp.minPadding,
+        mask_threshold: pp.maskThreshold,
+        feather_radius: pp.featherRadius,
+        crop_scale: pp.cropScale,
+        refine: pp.refine,
+        multimask: pp.multimask,
+        fill_holes: pp.fillHoles,
+      })
+      const result = (await waitTask(task.task_id, { intervalMs: 2000 })) as {
+        levels?: { z: number; file: string; count: number }[]
+        elapsed_sec?: number
+      }
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelPeelStatus: 'done',
+        panelPeelLevels: result?.levels ?? [],
+        panelPeelTick: Date.now(),
+        panelPeelElapsed: result?.elapsed_sec ?? 0,
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        panelPeelStatus: 'error',
+        panelPeelError: error instanceof Error ? error.message : '分层提取失败',
+      })
+    }
+  },
+
+  runPanelExtract: async () => {
+    const { runInfo, midFillStatus, panelExtractStatus } = get()
+    // 数据源:第 16 步审核结果(bbox 已纠删补,z 为 VL 修正的层级)
+    const audit = get().panelAuditItems
+    if (!runInfo || midFillStatus !== 'done') return
+    if (get().panelAuditStatus !== 'done' || audit.length === 0) return
     if (panelExtractStatus === 'running') return
     set({ panelExtractStatus: 'running', panelExtractError: '', panelExtractInfo: '' })
     try {
       const task = await submitTask('panel_extract', runInfo.run_id, {
-        panels: panels.map((p) => p.bbox),
+        panels: audit.map((a) => a.bbox),
+        z_order: audit.map((a) => a.z),
       })
       const result = (await waitTask(task.task_id)) as {
         count?: number

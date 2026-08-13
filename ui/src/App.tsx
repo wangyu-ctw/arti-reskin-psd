@@ -14,6 +14,7 @@ import BarDecomposePanel from './components/BarDecomposePanel'
 import MidHolePanel from './components/MidHolePanel'
 import MidFillPanel from './components/MidFillPanel'
 import CompareSliderPanel from './components/CompareSliderPanel'
+import PanelAuditPanel from './components/PanelAuditPanel'
 import PanelExtractPanel from './components/PanelExtractPanel'
 import SeedSeekPage from './pages/SeedSeekPage'
 
@@ -78,6 +79,9 @@ function App() {
         </div>
         <div className="h-full w-110 shrink-0">
           <CompareSliderPanel />
+        </div>
+        <div className="h-full w-110 shrink-0">
+          <PanelAuditPanel />
         </div>
         <div className="h-full w-110 shrink-0">
           <PanelExtractPanel />

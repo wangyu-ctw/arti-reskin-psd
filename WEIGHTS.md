@@ -12,7 +12,8 @@
 | Kontext 主模型(去文字) | `/workspace/models/FLUX.1-Kontext-dev/flux1-kontext-dev.safetensors` | 23G | `models/diffusion_models/flux1-kontext-dev.safetensors` | 在役 |
 | Fill 主模型(去icon补洞) | `/workspace/models/FLUX.1-Fill-dev/flux1-fill-dev.safetensors` | 23G | `models/diffusion_models/flux1-fill-dev.safetensors` | 在役 |
 | CLIP-L 文本编码 | `/workspace/models/FLUX.1-dev/text_encoder/model.safetensors` | 235M | `models/text_encoders/clip_l.safetensors` | 在役 |
-| T5-XXL 文本编码 | `/workspace/models/FLUX.1-dev/t5xxl_fp16_merged.safetensors`(手动合并分片) | ~9G | `models/text_encoders/t5xxl_fp16.safetensors` | 在役 |
+| T5-XXL 文本编码(fp8 scaled) | `/workspace/models/FLUX.1-dev/t5xxl_fp8_e4m3fn_scaled.safetensors` | 4.9G | `models/text_encoders/t5xxl_fp16.safetensors`(软链名未改) | 在役(2026-08-12 换装,32G 卡腾显存) |
+| T5-XXL 文本编码(fp16,回滚备份) | `/workspace/models/FLUX.1-dev/t5xxl_fp16_merged.safetensors`(手动合并分片) | ~9G | — | 备份(`ln -sfn` 即回滚) |
 | VAE | `/workspace/models/FLUX.1-dev/ae.safetensors` | 320M | `models/vae/ae.safetensors` | 在役 |
 | 去字 LoRA(2026-08-04 续训 step-1505) | `/workspace/outputs/text_back_20260804/step-1505.safetensors` | 1.2G | `models/loras/omnipsd_text_back.safetensors` | 在役(2026-08-04 上线) |
 | 去icon补洞 LoRA(Fill 范式,rank 32,3000 步) | `/workspace/outputs/icon_back_fill_20260804/pytorch_lora_weights.safetensors` | 172M | `models/loras/icon_back_fill.safetensors` | 在役·第 9 步(2026-08-04 上线) |

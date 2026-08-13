@@ -56,7 +56,8 @@ const MODES: Record<string, SeekMode> = {
     params: {
       prompt: stepDefaults.textBack.prompt,
       steps: stepDefaults.textBack.steps,
-      protect: true,
+      guidance: stepDefaults.textBack.guidance,
+      protect: false,
       protect_grow: 8,
       max_pixels: 1048576,
     },

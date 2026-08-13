@@ -33,6 +33,7 @@ export type TaskType =
   | 'icon_asset'
   | 'panel_asset'
   | 'panel_extract'
+  | 'panel_peel'
 
 async function toJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
