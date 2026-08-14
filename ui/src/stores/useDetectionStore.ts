@@ -75,6 +75,8 @@ export interface IconTierParams {
   refine: boolean
   multimask: boolean
   fillHoles: boolean
+  /** 把第 7 步分析的负点传给 SAM2(压邻近粘连/框外光晕) */
+  useNegPoints: boolean
 }
 
 // 第 9~11 步:中景层提取(assets/bar/button,从第 8 步结果图 icon_back.png 提取)
@@ -330,6 +332,13 @@ interface DetectionState {
   panelAuditItems: PanelAuditItem[]
   panelAuditDeleted: PanelAuditDeletion[]
   panelAuditImageUrl: string
+  // 第 16 步(新):Qwen-Layered 一步分层(替换旧 16/17 试验中)
+  qwenLayerParams: { layers: number; steps: number; seed: number; trueCfg: number }
+  qwenLayerStatus: TextBackStatus
+  qwenLayerError: string
+  qwenLayerFiles: string[]
+  qwenLayerTick: number
+  qwenLayerElapsed: number
   // 第 17 步:分层提取(拆-补-拆 剥洋葱,按 16 步层级整层出图)
   panelPeelParams: {
     seed: number
@@ -414,6 +423,7 @@ interface DetectionState {
   runPanelAsset: () => Promise<void>
   runPanelExtract: () => Promise<void>
   runPanelAudit: () => Promise<void>
+  runQwenLayer: () => Promise<void>
   runPanelPeel: () => Promise<void>
   submit: () => Promise<void>
   cancel: () => void
@@ -435,26 +445,28 @@ function loadImageSize(url: string): Promise<[number, number]> {
   })
 }
 
-/** 第 7 步分析点位的传递策略:只有小档 icon 传正点,负点及中/大档一律不传 */
+/** 第 7 步分析点位的传递策略:正点只有小档和溢出光效 icon 传;
+ *  负点按档位开关(默认三档全开)传,压住邻近粘连/框外光晕 */
 function analyzedToBorders(
   analyzed: AnalyzedIcon[],
   imgW: number,
   imgH: number,
   smallMaxSide: number,
+  largeMinSide: number,
+  tierParams: Record<IconTier, IconTierParams>,
 ): Record<string, unknown>[] {
   return analyzed.map((a) => {
-    // 带溢出光效的 icon:正负点同时采纳,负点压住框外光晕把光效切干净
-    if (a.has_overflow_glow) {
-      return {
-        bbox: a.bbox,
-        positive_points: a.positive_points,
-        negative_points: a.negative_points,
-      }
-    }
     const side = Math.max(a.bbox[2] * imgW, a.bbox[3] * imgH)
-    return side <= smallMaxSide
-      ? { bbox: a.bbox, positive_points: a.positive_points }
-      : { bbox: a.bbox }
+    const tier: IconTier =
+      side <= smallMaxSide ? 'small' : side >= largeMinSide ? 'large' : 'medium'
+    const b: Record<string, unknown> = { bbox: a.bbox }
+    if (a.has_overflow_glow || tier === 'small') {
+      b.positive_points = a.positive_points
+    }
+    if (tierParams[tier].useNegPoints) {
+      b.negative_points = a.negative_points
+    }
+    return b
   })
 }
 
@@ -723,6 +735,12 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
   panelAuditItems: [],
   panelAuditDeleted: [],
   panelAuditImageUrl: '',
+  qwenLayerParams: { ...stepDefaults.qwenLayer },
+  qwenLayerStatus: 'idle',
+  qwenLayerError: '',
+  qwenLayerFiles: [],
+  qwenLayerTick: 0,
+  qwenLayerElapsed: 0,
   panelPeelParams: { ...stepDefaults.panelPeel },
   panelPeelStatus: 'idle',
   panelPeelError: '',
@@ -806,6 +824,10 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       panelPeelError: '',
       panelPeelLevels: [],
       panelPeelTick: 0,
+      qwenLayerStatus: 'idle',
+      qwenLayerError: '',
+      qwenLayerFiles: [],
+      qwenLayerTick: 0,
       compareStatus: 'idle',
       compareImageUrl: '',
       compareError: '',
@@ -929,6 +951,19 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         }
       }
 
+      // 第 16 步(新)Qwen 分层结果(panel_layers_qwen/manifest.json)
+      let restoredQwen: string[] = []
+      if (has('panel_layers_qwen/manifest.json')) {
+        try {
+          const metaQ = (await (
+            await fetch(fileUrl('panel_layers_qwen/manifest.json'))
+          ).json()) as { files?: string[] }
+          restoredQwen = (metaQ.files ?? []).filter((f) => has(f))
+        } catch {
+          restoredQwen = []
+        }
+      }
+
       // 第 17 步分层提取结果(panel_layers/manifest.json)
       let restoredPeel: { z: number; file: string; count: number }[] = []
       if (has('panel_layers/manifest.json')) {
@@ -990,6 +1025,10 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         panelAuditDeleted: restoredAuditDeleted,
         panelAuditImageUrl: restoredAuditImage,
         barConsumedOverlays: restoredConsumed,
+        qwenLayerStatus: restoredQwen.length ? 'done' : 'idle',
+        qwenLayerError: '',
+        qwenLayerFiles: restoredQwen,
+        qwenLayerTick: Date.now(),
         panelPeelStatus: restoredPeel.length ? 'done' : 'idle',
         panelPeelError: '',
         panelPeelLevels: restoredPeel,
@@ -1201,9 +1240,9 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
 
   runExtractIcons: async () => {
     const { runInfo, structuredResult, textBackStatus, iconStatus, iconSource } = get()
-    // 有第 7 步分析结果时:只有小档 icon 传正点,负点及中/大档一律不传;
+    // 有第 7 步分析结果时:正点只有小档传,负点按档位开关(默认全开);
     // 无分析结果退回原始检测框(与第 5 步同口径,过滤 discard)
-    const { analyzedIcons, iconSmallMaxSide } = get()
+    const { analyzedIcons, iconSmallMaxSide, iconLargeMinSide, iconTierParams } = get()
     if (!runInfo) return
     // 涉及去文字图的模式(text_back / auto)需要第 2 步已出结果;纯原图不需要
     if (iconSource !== 'origin' && textBackStatus !== 'done') return
@@ -1213,7 +1252,8 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       const [iw, ih] = await loadImageSize(
         `/api/runs/${runInfo.run_id}/files/${srcName}`,
       )
-      borders = analyzedToBorders(analyzedIcons, iw, ih, iconSmallMaxSide)
+      borders = analyzedToBorders(analyzedIcons, iw, ih, iconSmallMaxSide,
+                                  iconLargeMinSide, iconTierParams)
     } else {
       borders = pickDetections(structuredResult, 'icon').map((d) => ({
         bbox: d.bbox,
@@ -1326,15 +1366,16 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
         return
       }
       // 全量重抠:有修正的 icon 换上修正框+修正点(质检看的是当前结果,
-      // 其点位优先);其余按第 7 步传点策略(仅小档正点)或 box-only
-      const { analyzedIcons, iconSmallMaxSide } = get()
+      // 其点位优先);其余按第 7 步传点策略(小档正点+按档位负点)或 box-only
+      const { analyzedIcons, iconSmallMaxSide, iconLargeMinSide, iconTierParams } = get()
       const fixMap = new Map(fixes.map((f) => [f.index, f]))
       let base: Record<string, unknown>[]
       if (analyzedIcons?.length) {
         const [iw, ih] = await loadImageSize(
           `/api/runs/${runInfo.run_id}/files/${srcName}`,
         )
-        base = analyzedToBorders(analyzedIcons, iw, ih, iconSmallMaxSide)
+        base = analyzedToBorders(analyzedIcons, iw, ih, iconSmallMaxSide,
+                                 iconLargeMinSide, iconTierParams)
       } else {
         base = icons.map((d) => ({ bbox: d.bbox }))
       }
@@ -2195,6 +2236,41 @@ export const useDetectionStore = create<DetectionState>((set, get) => ({
       set({
         panelAuditStatus: 'error',
         panelAuditError: error instanceof Error ? error.message : '审核失败',
+      })
+    }
+  },
+
+  runQwenLayer: async () => {
+    const { runInfo, midFillStatus } = get()
+    if (!runInfo || midFillStatus !== 'done') return
+    if (get().qwenLayerStatus === 'running') return
+    set({ qwenLayerStatus: 'running', qwenLayerError: '' })
+    try {
+      const qp = get().qwenLayerParams
+      const task = await submitTask('qwen_layered', runInfo.run_id, {
+        image: 'mid_fill.png',
+        output_dir: 'panel_layers_qwen',
+        layers: qp.layers,
+        steps: qp.steps,
+        seed: qp.seed,
+        true_cfg: qp.trueCfg,
+      })
+      const result = (await waitTask(task.task_id, { intervalMs: 3000 })) as {
+        files?: string[]
+        elapsed_sec?: number
+      }
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        qwenLayerStatus: 'done',
+        qwenLayerFiles: result?.files ?? [],
+        qwenLayerTick: Date.now(),
+        qwenLayerElapsed: result?.elapsed_sec ?? 0,
+      })
+    } catch (error) {
+      if (get().runInfo?.run_id !== runInfo.run_id) return
+      set({
+        qwenLayerStatus: 'error',
+        qwenLayerError: error instanceof Error ? error.message : '分层失败',
       })
     }
   },

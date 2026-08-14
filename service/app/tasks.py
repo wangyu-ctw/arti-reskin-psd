@@ -2725,6 +2725,51 @@ def handle_panel_peel(payload: dict) -> dict:
     return manifest
 
 
+def handle_qwen_layered(payload: dict) -> dict:
+    """第 16 步(新):Qwen-Image-Layered 一步分层(代理 127.0.0.1:8195 daemon)。
+
+    payload:
+        run_id / dir   二选一
+        image          输入图,默认 mid_fill.png
+        output_dir     输出目录名,默认 panel_layers_qwen
+        layers         层数(含 bg),默认 6(= 训练口径 bg+5)
+        steps/seed/true_cfg   采样参数,默认 40/7/4.0
+    返回 daemon 的 manifest:{files:[...], elapsed_sec}
+    仅双卡布局可用(daemon 常驻 GPU1);单卡日会连接失败。
+    """
+    if payload.get("dir"):
+        run_dir = Path(payload["dir"])
+    else:
+        run_dir = storage.get_run_dir(payload["run_id"])
+    import urllib.request as _ur
+    import urllib.error as _ue
+    import json as _json
+    body = _json.dumps({
+        "dir": str(run_dir),
+        "image": payload.get("image") or "mid_fill.png",
+        "output_dir": payload.get("output_dir") or "panel_layers_qwen",
+        "layers": int(payload.get("layers", 6)),
+        "steps": int(payload.get("steps", 40)),
+        "seed": int(payload.get("seed", 7)),
+        "true_cfg": float(payload.get("true_cfg", 4.0)),
+    }).encode()
+    req = _ur.Request("http://127.0.0.1:8195/decompose", data=body,
+                      headers={"Content-Type": "application/json"})
+    try:
+        with _ur.urlopen(req, timeout=900) as resp:
+            return _json.loads(resp.read())
+    except _ue.HTTPError as e:
+        detail = ""
+        try:
+            detail = _json.loads(e.read().decode()).get("error", "")
+        except Exception:
+            pass
+        raise RuntimeError(f"qwen layered daemon HTTP {e.code}: {detail[-2000:]}")
+    except _ue.URLError as e:
+        raise RuntimeError(
+            f"qwen layered daemon 不可达({e.reason});该功能需要双卡布局") from None
+
+
 def register_all() -> None:
     worker.register("hello", handle_hello)
     worker.register("text_back", handle_text_back)
@@ -2740,3 +2785,4 @@ def register_all() -> None:
     worker.register("panel_asset", handle_panel_asset)
     worker.register("panel_extract", handle_panel_extract)
     worker.register("panel_peel", handle_panel_peel)
+    worker.register("qwen_layered", handle_qwen_layered)

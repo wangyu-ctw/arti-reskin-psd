@@ -34,6 +34,7 @@ export type TaskType =
   | 'panel_asset'
   | 'panel_extract'
   | 'panel_peel'
+  | 'qwen_layered'
 
 async function toJson<T>(res: Response): Promise<T> {
   if (!res.ok) {

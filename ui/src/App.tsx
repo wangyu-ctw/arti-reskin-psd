@@ -14,8 +14,10 @@ import BarDecomposePanel from './components/BarDecomposePanel'
 import MidHolePanel from './components/MidHolePanel'
 import MidFillPanel from './components/MidFillPanel'
 import CompareSliderPanel from './components/CompareSliderPanel'
-import PanelAuditPanel from './components/PanelAuditPanel'
-import PanelExtractPanel from './components/PanelExtractPanel'
+// 旧 16/17 步(panel修正 + 分层提取)暂由 Qwen 一步分层替换试验,代码保留:
+// import PanelAuditPanel from './components/PanelAuditPanel'
+// import PanelExtractPanel from './components/PanelExtractPanel'
+import QwenLayerPanel from './components/QwenLayerPanel'
 import SeedSeekPage from './pages/SeedSeekPage'
 
 function App() {
@@ -80,11 +82,16 @@ function App() {
         <div className="h-full w-110 shrink-0">
           <CompareSliderPanel />
         </div>
+        {/* 旧 16/17 步保留,试验期由 Qwen 一步分层替换:
         <div className="h-full w-110 shrink-0">
           <PanelAuditPanel />
         </div>
         <div className="h-full w-110 shrink-0">
           <PanelExtractPanel />
+        </div>
+        */}
+        <div className="h-full w-110 shrink-0">
+          <QwenLayerPanel />
         </div>
       </div>
     </main>

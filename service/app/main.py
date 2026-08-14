@@ -41,9 +41,17 @@ def hello():
 
 @app.get("/health")
 def health():
+    import urllib.request as _ur
+    try:
+        with _ur.urlopen("http://127.0.0.1:8195/health", timeout=1) as r:
+            import json as _json
+            qwen_up = bool(_json.loads(r.read()).get("ok"))
+    except Exception:
+        qwen_up = False
     return {"status": "ok", "data_root": str(DATA_ROOT), "worker": worker.stats(),
             "task_types": worker.known_types(), "comfyui_up": comfy.is_up(),
-            "sam2_up": sam2c.is_up(), "yolo_up": yoloc.is_up()}
+            "sam2_up": sam2c.is_up(), "yolo_up": yoloc.is_up(),
+            "qwen_layered_up": qwen_up}
 
 
 # ---- run 管理 ----

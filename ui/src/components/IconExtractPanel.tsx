@@ -82,6 +82,13 @@ function TierSection({
         >
           <span className="text-[11px]">mask 自动封孔</span>
         </Checkbox>
+        <Checkbox
+          checked={params.useNegPoints}
+          disabled={disabled}
+          onChange={(e) => setIconTierParam(tier, 'useNegPoints', e.target.checked)}
+        >
+          <span className="text-[11px]">采用负点</span>
+        </Checkbox>
       </div>
     </div>
   )
@@ -151,7 +158,9 @@ function SettingsPopover() {
             <br />
             二轮精化=mask_input 再收敛一轮，有填洞倾向，保留区偏多时先关它 ·
             多候选取最优=icon 连衬底整块被抠时开它，常能选中更细粒度 ·
-            mask 自动封孔=每个 icon 的 mask 实心无镂空，想保留镂空处透明就关掉
+            mask 自动封孔=每个 icon 的 mask 实心无镂空，想保留镂空处透明就关掉 ·
+            采用负点=把第 7 步分析的负点传给 SAM2 压住粘连/光晕，误伤 icon 本体时关掉该档
+            （需要第 7 步已分析）
           </div>
         </div>
       }
@@ -284,7 +293,7 @@ export default function IconExtractPanel() {
           ) : (
             <span className="text-[12px] text-black/45">
               将以「{sourceLabel}」提取 {iconCount} 个 icon
-              {useAnalyzed ? '（小图标带第 7 步正点，其余仅检测框）' : '（未分析，使用原始检测框）'}
+              {useAnalyzed ? '（小图标带第 7 步正点，负点按档位开关）' : '（未分析，使用原始检测框）'}
             </span>
           )}
         </div>

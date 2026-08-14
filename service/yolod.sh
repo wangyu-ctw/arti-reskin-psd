@@ -15,6 +15,11 @@ if pgrep -f "[y]olo_daemon.py" > /dev/null; then
     exit 0
 fi
 
+# 双卡布局:run.sh 设 DETECT_GPU 时钉到指定卡
+if [ -n "${DETECT_GPU:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="$DETECT_GPU"
+fi
+
 mkdir -p "$(dirname "$LOG")"
 cd /workspace/ui_skin
 nohup "$YOLO_PYTHON" "$DAEMON" > "$LOG" 2>&1 &

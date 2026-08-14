@@ -1,15 +1,23 @@
-"""GPU worker:单线程 + FIFO 队列。
+"""GPU worker:FIFO 队列,支持单/双泳道。
 
-- 全服务只有这一个 worker 线程,queue.Queue 保证严格 FIFO;
-- 同一时刻最多一个 handler 在跑,即一张 RTX PRO 6000 同时只有一个任务占用 GPU;
+- 单卡(默认):一条 worker 线程,全部任务严格 FIFO,GPU 串行;
+- 双卡(SERVICE_LANE_MODE=dual,run.sh 按 GPU 数设定):两条泳道并行——
+  gpu0 泳道跑 ComfyUI/FLUX 系任务,gpu1 泳道跑 YOLO/SAM2/CPU 任务;
+  泳道内部仍 FIFO。跨泳道的复合任务(panel_peel 等)归 gpu0,
+  中途调 sam2/yolo daemon 时由 daemon 自身的锁串行,安全;
 - HTTP 层提交任务立即返回 task_id,通过轮询查状态,规避 RunPod Proxy 长请求超时。
 """
+import os
 import queue
 import threading
 import time
 import traceback
 import uuid
 from typing import Any, Callable, Optional
+
+# 双泳道下走 gpu1 的任务类型(检测/分割/纯 CPU);其余默认 gpu0(Comfy 系)
+GPU1_TYPES = {"yolo", "sam2", "hello", "mid_hole", "panel_asset",
+              "icon_asset", "qwen_layered"}
 
 
 class Task:
@@ -42,13 +50,24 @@ class Task:
 
 class GPUWorker:
     def __init__(self):
-        self._queue: "queue.Queue[Task]" = queue.Queue()
+        self._dual = os.environ.get("SERVICE_LANE_MODE", "single") == "dual"
+        self._lanes = ("gpu0", "gpu1") if self._dual else ("gpu0",)
+        self._queues: dict[str, "queue.Queue[Task]"] = {
+            lane: queue.Queue() for lane in self._lanes}
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
         self._handlers: dict[str, Callable[[dict], Any]] = {}
-        self._current: Optional[Task] = None
-        self._thread = threading.Thread(target=self._loop, name="gpu-worker", daemon=True)
+        self._current: dict[str, Optional[Task]] = {lane: None for lane in self._lanes}
+        self._threads = [
+            threading.Thread(target=self._loop, args=(lane,),
+                             name=f"gpu-worker-{lane}", daemon=True)
+            for lane in self._lanes]
         self._started = False
+
+    def _lane_of(self, task_type: str) -> str:
+        if self._dual and task_type in GPU1_TYPES:
+            return "gpu1"
+        return "gpu0"
 
     # ---- handler 注册 ----
 
@@ -63,7 +82,8 @@ class GPUWorker:
     def start(self) -> None:
         if not self._started:
             self._started = True
-            self._thread.start()
+            for t in self._threads:
+                t.start()
 
     # ---- 提交 / 查询 ----
 
@@ -73,7 +93,7 @@ class GPUWorker:
         task = Task(task_type, payload)
         with self._lock:
             self._tasks[task.id] = task
-        self._queue.put(task)
+        self._queues[self._lane_of(task_type)].put(task)
         return task
 
     def get(self, task_id: str) -> Optional[Task]:
@@ -84,8 +104,9 @@ class GPUWorker:
         """排队中的任务在队列里的位置(0 = 下一个执行)。非 queued 状态返回 None。"""
         if task.status != "queued":
             return None
+        lane = self._lane_of(task.type)
         with self._lock:
-            pending = [t for t in self._queue.queue if t.status == "queued"]
+            pending = [t for t in self._queues[lane].queue if t.status == "queued"]
         try:
             return pending.index(task)
         except ValueError:
@@ -93,20 +114,27 @@ class GPUWorker:
 
     def stats(self) -> dict:
         with self._lock:
-            current = self._current
+            running = {lane: (t.to_dict() if t else None)
+                       for lane, t in self._current.items()}
+            any_running = next((v for v in running.values() if v), None)
             return {
-                "queued": self._queue.qsize(),
-                "running": current.to_dict() if current else None,
+                "queued": sum(q.qsize() for q in self._queues.values()),
+                # 兼容旧字段:任一泳道在跑就展示它
+                "running": any_running,
                 "total_tasks": len(self._tasks),
+                "lanes": {lane: {"queued": self._queues[lane].qsize(),
+                                 "running": running[lane]}
+                          for lane in self._lanes},
             }
 
     # ---- worker 主循环 ----
 
-    def _loop(self) -> None:
+    def _loop(self, lane: str) -> None:
+        q = self._queues[lane]
         while True:
-            task = self._queue.get()
+            task = q.get()
             with self._lock:
-                self._current = task
+                self._current[lane] = task
             task.status = "running"
             task.started_at = time.time()
             try:
@@ -119,8 +147,8 @@ class GPUWorker:
             finally:
                 task.finished_at = time.time()
                 with self._lock:
-                    self._current = None
-                self._queue.task_done()
+                    self._current[lane] = None
+                q.task_done()
 
 
 # 全局唯一 worker 实例(run.sh 用 --workers 1 启动,进程内单例即全局单例)

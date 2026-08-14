@@ -33,7 +33,8 @@
       "cropScale": 5,
       "refine": false,
       "multimask": true,
-      "fillHoles": true
+      "fillHoles": true,
+      "useNegPoints": true
     },
     "medium": {
       "paddingRatio": 0.02,
@@ -43,7 +44,8 @@
       "cropScale": 4.5,
       "refine": false,
       "multimask": true,
-      "fillHoles": true
+      "fillHoles": true,
+      "useNegPoints": true
     },
     "large": {
       "paddingRatio": 0.03,
@@ -53,7 +55,8 @@
       "cropScale": 3.5,
       "refine": true,
       "multimask": false,
-      "fillHoles": true
+      "fillHoles": true,
+      "useNegPoints": true
     }
   },
   "assetsExtract": {
@@ -170,5 +173,11 @@
     "refine": true,
     "multimask": false,
     "fillHoles": true
+  },
+  "qwenLayer": {
+    "layers": 6,
+    "steps": 40,
+    "seed": 7,
+    "trueCfg": 4.0
   }
 }
