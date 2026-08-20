@@ -16,7 +16,11 @@ import uuid
 from typing import Any, Callable, Optional
 
 # 双泳道下走 gpu1 的任务类型(检测/分割/纯 CPU);其余默认 gpu0(Comfy 系)
-GPU1_TYPES = {"yolo", "sam2", "hello", "mid_hole", "panel_asset",
+# p2_sixslot/p2_panelz 是分钟级 qwen 生成,走 gpu0 主泳道;
+# 轻任务(检测/审核/抠取)走 gpu1 泳道,与生成并行不排队
+GPU1_TYPES = {"yolo", "sam2", "hello", "mid_hole", "panel_asset", "element_extract",
+              "p2_detect", "p2_yolo", "p2_gpt", "p2_extract", "p2_assets",
+              "p2_layer_yolo", "p2_inventory", "p2_cascade", "p2_psd", "p2_recompose",
               "icon_asset", "qwen_layered"}
 
 

@@ -2,4 +2,8 @@ fastapi>=0.110
 uvicorn>=0.29
 python-multipart>=0.0.9
 pillow>=10.0
-
+numpy>=1.26
+scipy>=1.11
+# p2_psd:多层 PSD 写出(RLE cython 扩展在 py312 编不出,代码里用 raw 压缩)
+pytoshop>=1.2
+six>=1.16

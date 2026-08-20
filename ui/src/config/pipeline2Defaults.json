@@ -1,0 +1,49 @@
+{
+  "sixSlot": {
+    "steps": 20,
+    "seed": 7,
+    "trueCfg": 4.0,
+    "resolution": 1024,
+    "outputDir": "p2_sixslot"
+  },
+  "panelz": {
+    "steps": 20,
+    "seed": 7,
+    "trueCfg": 4.0,
+    "resolution": 1024,
+    "layers": 6,
+    "inputFile": "p2_panelz_input.png",
+    "outputDir": "p2_panelz"
+  },
+  "emptyCoverage": 0.002,
+  "yolo": {
+    "model": "game0804_p2",
+    "imgsz": 1600,
+    "conf": 0.1,
+    "iou": 0.7,
+    "dedupIou": 0.8,
+    "pasteBg": "#808080"
+  },
+  "gpt": {
+    "model": "openai/gpt-5.6-sol",
+    "effort": "high",
+    "speed": "balanced",
+    "prompt": "你是游戏 UI 结构审核员。给你两张图:图1是游戏 UI 原图,图2是同一张图叠加了编号检测框(每个框来自某个分离层的元素检测;z0/z1 等来源层是 panel 底板分层)。另有 JSON 元素清单:id、来源层(controls/assets/panel_f/icon/text/z0..)、检测类别、bbox。\n\n【类别定义】(判定时严格按此口径)\n- text:普通可读文本。艺术字徽标(N/R/SR/SSR/UR、S/A/B/C 评级等风格化字母图形)不是 text,归 icon。\n- icon:图形符号,且能说出具体功能(点击会发生什么/表示哪种资源、数量、状态)。可点击的图形主体(占底板一半以上)整体算 icon,不算 button;圆形关闭按钮(圆框+X)整体一个 icon;翻页/展开/下拉箭头都是 icon。说不出功能的对称纹样、光效、边角装饰是装饰,不是元素。\n- assets:内容会随玩家数据变化的图像——头像(连头像框整体)、角色立绘(连底座影子)、装备/道具/技能图。为 assets 占位的格子(空位/上锁/已选/禁止)连同状态遮罩整体算一个 assets,锁头对号不单独拆。\n- button:块状底板式点击区域(长条确认键、宽大入口卡片)。可点击≠button:图形占主体的归 icon;与内容面板连体的 tab 归 panel。\n- panel:承载/划分/衬托用的底板,无交互。z0/z1 等来源层里的板子默认候选 panel。\n- panel_f:前景夹层面板,z 序在 text/icon 之下、assets/button/bar 之上。判据按优先级:①遮压中景(压住 assets/button/bar 的一部分,一票定性)②承载前景(是 text/icon 的直接衬底)③带透明度的色块形态。只满足②③且直接铺在背景上的仍是 panel。\n\n【bar 专节——重点类别,多花注意力】\n- 形态:横向、纵向、环形(技能冷却圈、音量条、滚动条都算);类型:progress/slide/scroll bar。\n- 判据:有可见的\"底板槽 + 进度填充\"双层结构、刻度、滑块(handle)或进度差异。进度末端的滑块/端帽图标归入 bar 本体。\n- 通栏排除(一票否决):同时满足①贯穿容器/画面宽高、两端顶到边缘 ②通体一色无槽体-填充区分、无刻度滑块 ③无阶段奖励节点依附——则是分隔线/镶边,严禁判 bar;三条有一条不满足仍按 bar 判。\n- 隐蔽形态务必排查:列表/关卡链/通行证的节点之间常有连接轨道,被头像格子压住只露短段,已完成段亮、未完成段灰——这是一整条 bar,bbox 按完整走向给(含被遮挡段),严禁把露出的小段当装饰。\n- bbox 范围:沿走向两端找真正端点(端帽、端点装饰、被遮挡延伸段),垂直方向含描边、凹槽外缘、外发光,不要只框内部填充。\n- 缺拆补报双确认(缺一不报):①功能确认——能说出它表达什么进度/数值(经验、血量、滚动位置等);②形状确认——可见轨道边缘 + 填充或槽体至少一样清晰。只像不确认的是装饰,不补。\n\n【任务】逐元素输出:\n1. type:按上面定义判定真实类型(text/icon/button/assets/bar/panel/panel_f;判不了给 unknown)。特别检查:controls 层元素是 bar 被误判 button、或 button 被误判 bar 的情况。\n2. cover:panel、panel_f、assets、icon 类元素判断是否叠有状态含义的覆盖效果——选中/强调光效(selected/highlight)、失效(disabled)、已领取(claimed)、锁定(locked);没有则 none。有覆盖效果的后续会被跳过处理。\n3. verdict:ok=正常;over_split=该元素只是另一个元素的一部分(过拆,merge_into 填应并入的 id,如 bar 的填充/滑块/端帽被单独检出必须并回 bar 整体);mis_type=类别判错(以 type 为准)。\n\n然后检查缺拆(missing):对照原图,找出 text、icon、button、assets、bar 五类中\"原图可见、但清单里没有\"的目标。**bar 优先逐处排查**(它最容易被漏:被遮挡的轨道、环形进度圈、滚动条、隐蔽连接轨道),再查其余类别。missing 给出:所在分离层(text→text 层,icon→icon 层,button/bar→controls 层,assets→assets 层)、类型、归一化 bbox([cx,cy,w,h],0~1;bar 按完整走向含被遮挡段)和一句说明。宁缺毋滥,bar 按双确认执行。\n\n注意:bbox 坐标是几何权威,除 missing 外不要改动;所有 id 必须来自清单。"
+  },
+  "extract": {
+    "outDir": "p2_elements",
+    "alphaThr": 8,
+    "padRatio": 0.25,
+    "overflowPx": 8
+  },
+  "sam2": {
+    "paddingRatio": 0.02,
+    "minPadding": 2,
+    "maskThreshold": 0.55,
+    "featherRadius": 1,
+    "cropScale": 4.5,
+    "refine": false,
+    "multimask": true,
+    "fillHoles": false
+  }
+}

@@ -35,6 +35,19 @@ export type TaskType =
   | 'panel_extract'
   | 'panel_peel'
   | 'qwen_layered'
+  | 'element_extract'
+  | 'p2_detect'
+  | 'p2_sixslot'
+  | 'p2_panelz'
+  | 'p2_yolo'
+  | 'p2_gpt'
+  | 'p2_extract'
+  | 'p2_assets'
+  | 'p2_layer_yolo'
+  | 'p2_inventory'
+  | 'p2_cascade'
+  | 'p2_psd'
+  | 'p2_recompose'
 
 async function toJson<T>(res: Response): Promise<T> {
   if (!res.ok) {

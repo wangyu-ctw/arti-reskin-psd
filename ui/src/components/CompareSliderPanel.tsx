@@ -2,8 +2,9 @@ import { useCallback, useRef, useState } from 'react'
 import { Button, Card, Spin } from 'antd'
 import { useDetectionStore } from '../stores/useDetectionStore'
 
-/** 拖动分界线的双图对比:左侧露原图,右侧露新图,拖柄居中可拖。 */
-function ImageCompareSlider({
+/** 拖动分界线的双图对比:左侧露原图,右侧露新图,拖柄居中可拖。
+ *  (被 /pipeline2 第 ④ 步复用,改动需两边兼容) */
+export function ImageCompareSlider({
   leftSrc,
   rightSrc,
 }: {

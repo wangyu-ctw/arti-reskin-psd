@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
@@ -104,7 +105,66 @@ function runpodProxyPlugin(): Plugin {
   }
 }
 
+// 训练数据浏览(/sixslot、/panelz 页):dev server 直接读本机 ~/Desktop/训练数据,
+// 不经 RunPod。TRAIN_DATA_DIR 环境变量可换根目录。
+//   GET /__train-data/<数据集>/list                 样本 stem 清单(train/ 下有 meta.json 的目录)
+//   GET /__train-data/<数据集>/train/<stem>/<file>  静态文件(png/json)
+const trainDataRoot =
+  process.env.TRAIN_DATA_DIR ?? path.join(os.homedir(), 'Desktop/训练数据')
+
+function trainDataPlugin(): Plugin {
+  const rootNorm = path.normalize(trainDataRoot)
+  return {
+    name: 'train-data-local',
+    configureServer(server) {
+      server.middlewares.use('/__train-data', (req: IncomingMessage, res: ServerResponse) => {
+        res.setHeader('Content-Type', 'application/json')
+        const url = decodeURIComponent((req.url ?? '/').split('?')[0])
+        const listMatch = url.match(/^\/([^/]+)\/list$/)
+        if (listMatch) {
+          try {
+            const dsDir = path.normalize(path.join(trainDataRoot, listMatch[1]))
+            if (!dsDir.startsWith(rootNorm + path.sep)) throw new Error('非法数据集名')
+            // val 在前:验收时最先看
+            const samples: { stem: string; split: string }[] = []
+            for (const split of ['val', 'train']) {
+              const dir = path.join(dsDir, split)
+              if (!fs.existsSync(dir)) continue
+              for (const d of fs.readdirSync(dir).sort()) {
+                if (fs.existsSync(path.join(dir, d, 'meta.json'))) {
+                  samples.push({ stem: d, split })
+                }
+              }
+            }
+            res.end(JSON.stringify({ samples }))
+          } catch (e) {
+            res.statusCode = 500
+            res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }))
+          }
+          return
+        }
+        const fp = path.normalize(path.join(trainDataRoot, url))
+        if (!fp.startsWith(rootNorm + path.sep)) {
+          res.statusCode = 403
+          res.end(JSON.stringify({ error: 'forbidden' }))
+          return
+        }
+        if (!fs.existsSync(fp) || !fs.statSync(fp).isFile()) {
+          res.statusCode = 404
+          res.end(JSON.stringify({ error: 'not found' }))
+          return
+        }
+        res.setHeader(
+          'Content-Type',
+          path.extname(fp) === '.png' ? 'image/png' : 'application/json',
+        )
+        fs.createReadStream(fp).pipe(res)
+      })
+    },
+  }
+}
+
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), tailwindcss(), runpodProxyPlugin()],
+  plugins: [react(), tailwindcss(), runpodProxyPlugin(), trainDataPlugin()],
 })

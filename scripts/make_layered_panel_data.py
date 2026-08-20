@@ -7,8 +7,10 @@
                            amodal 完整——直接取 PSD 图层,被遮挡部分天然存在)
   meta.json                {levels, captions, recompose_error}
 
-z 分层规则(与前端 16/17 步口径一致):按 PSD 堆叠序自底向上,
-level_i = 与已分配 panel 有重叠者的最大 level + 1,无重叠为 0。
+z 分层规则(v3 口径:自底向上紧凑):按 PSD 堆叠序自底向上,
+level_i = 与其下方已分配 panel 有重叠者的最大 level + 1,无重叠为 0。
+独立 panel 一律 z0,层号是绝对语义(z0 恒非空、空层只在尾部)——
+与基座"底部在前、逐层紧凑"的先验一致,避免推理时独立 panel 漂到顶槽。
 
 质检:bg + 各层 alpha 依序叠回 与 直接合成图 逐像素比,误差超阈值剔除。
 
@@ -84,25 +86,21 @@ def collect_panels(group) -> list:
 
 
 def assign_levels(panels, tol=3) -> list:
-    """自顶向下分层(用户口径):从 PS 图层列表第一个叶子(堆叠最顶)开始
-    往下找,与上方已处理图层不搭边的浮进尽量高的层;被压住的往下沉一层。
-    返回每个 panel 的 level(0=最底,越大越上层),层内互不重叠。"""
+    """自底向上紧凑分层(v3 口径):panels 已按堆叠序(底→顶)排列,
+    level_i = 与其下方已分配 panel 有重叠者的最大 level + 1,无重叠为 0。
+    独立 panel 一律 z0。返回每个 panel 的 level(0=最底),层内互不重叠。"""
     def overlap(a, b):
         return (a[0] < b[2] - tol and b[0] < a[2] - tol and
                 a[1] < b[3] - tol and b[1] < a[3] - tol)
 
-    n = len(panels)
-    # topdown:depth=距顶层的深度(0=顶)
-    depth = [0] * n
-    order = list(range(n - 1, -1, -1))  # 堆叠序反转 = PS 列表自上而下
-    for pos, i in enumerate(order):
-        d = 0
-        for j in order[:pos]:  # j 在 i 上方
-            if overlap(panels[i][0], panels[j][0]):
-                d = max(d, depth[j] + 1)
-        depth[i] = d
-    top = max(depth)
-    return [top - d for d in depth]  # 转成 0=最底 的 level
+    levels = []
+    for i, (bbox, _) in enumerate(panels):
+        l = 0
+        for j in range(i):  # j 在 i 下方(堆叠序)
+            if overlap(panels[j][0], bbox):
+                l = max(l, levels[j] + 1)
+        levels.append(l)
+    return levels
 
 
 def main() -> None:
@@ -118,6 +116,8 @@ def main() -> None:
                         help="只重跑清单里的样本(txt,每行一个 <game>_<psd名> stem)")
     parser.add_argument("--name", type=str, default="layered_panel",
                         help="输出目录名(写到 <output>/<name>,便于多版本并存不覆盖)")
+    parser.add_argument("--split", type=str, default=None,
+                        help="强制输出到该 split 子目录(train/val),覆盖 --val-game 逻辑")
     args = parser.parse_args()
     only = None
     if args.only:
@@ -127,10 +127,15 @@ def main() -> None:
     stats = Counter()
     level_hist = Counter()
 
-    games = sorted(p.name for p in args.input_root.iterdir() if p.is_dir())
-    for game in games:
-        split = "val" if game == args.val_game else "train"
-        for psd_path in sorted((args.input_root / game).rglob("*.psd")):
+    # 常规:<input-root>/<游戏>/**.psd;平铺:PSD 直接在 input-root 下
+    units = [(p.name, sorted(p.rglob("*.psd")))
+             for p in sorted(args.input_root.iterdir()) if p.is_dir()]
+    root_psds = sorted(args.input_root.glob("*.psd"))
+    if root_psds:
+        units.append((args.input_root.name, root_psds))
+    for game, psd_paths in units:
+        split = args.split or ("val" if game == args.val_game else "train")
+        for psd_path in psd_paths:
             if only is not None and f"{game}_{psd_path.stem}" not in only:
                 continue
             try:

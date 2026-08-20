@@ -19,11 +19,36 @@ import CompareSliderPanel from './components/CompareSliderPanel'
 // import PanelExtractPanel from './components/PanelExtractPanel'
 import QwenLayerPanel from './components/QwenLayerPanel'
 import SeedSeekPage from './pages/SeedSeekPage'
+import Pipeline2Page from './pages/Pipeline2Page'
+import TrainDataViewerPage, {
+  panelZConfig,
+  panelZPredConfig,
+  sixSlotConfig,
+  sixSlotPredConfig,
+} from './pages/TrainDataViewer'
 
 function App() {
   // 独立工具路由:/seedseek 找 seed 工具(vite dev 的 SPA fallback 会兜底到 index.html)
   if (window.location.pathname.startsWith('/seedseek')) {
     return <SeedSeekPage />
+  }
+  // /pipeline2 新管线(layered+YOLO,独立 store/config,不动旧管线)
+  if (window.location.pathname.startsWith('/pipeline2')) {
+    return <Pipeline2Page />
+  }
+  // 训练数据浏览页(读本机数据,不经 RunPod):/sixslot 六槽整图,/panelz panel 分层,
+  // /sixslot-pred 六槽推理结果(前缀重叠,必须先于 /sixslot 判断)
+  if (window.location.pathname.startsWith('/sixslot-pred')) {
+    return <TrainDataViewerPage config={sixSlotPredConfig} />
+  }
+  if (window.location.pathname.startsWith('/sixslot')) {
+    return <TrainDataViewerPage config={sixSlotConfig} />
+  }
+  if (window.location.pathname.startsWith('/panelz-pred')) {
+    return <TrainDataViewerPage config={panelZPredConfig} />
+  }
+  if (window.location.pathname.startsWith('/panelz')) {
+    return <TrainDataViewerPage config={panelZConfig} />
   }
   return (
     <main className="h-screen overflow-x-auto bg-neutral-100">

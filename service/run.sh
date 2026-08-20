@@ -9,14 +9,17 @@ cd "$SERVICE_DIR"
 DATA_ROOT="${SERV_DATA_ROOT:-/workspace/servData}"
 mkdir -p "$DATA_ROOT/_logs"
 
-# 依赖装进 /workspace 上的 venv(网络卷常驻,pod 重启不丢)。
-# 按 Python 小版本分目录:不同 pod 模板的 python3 版本可能不同(3.11/3.12),
-# venv 跨版本会坏(No module named xxx),各版本各建一个互不干扰
+# 依赖装进容器本地盘的 venv:网络卷(mfs)会随机丢小文件,venv 放卷上
+# 反复损坏(bin/python 消失、包缺 __main__)。venv 是一次性产物,每个
+# pod 首次启动重建一次(~30s),不值得为持久化冒损坏风险。
+# 按 Python 小版本分目录:不同 pod 模板 python3 版本不同(3.11/3.12)
 PYV=$(python3 -c 'import sys; print(f"py{sys.version_info[0]}{sys.version_info[1]}")')
-VENV="$SERVICE_DIR/.venv-$PYV"
+VENV="${SERVICE_VENV_DIR:-/root/.venvs}/service-$PYV"
+mkdir -p "$(dirname "$VENV")"
 if [ ! -x "$VENV/bin/python" ]; then
     echo "[run.sh] creating venv at $VENV ..."
-    python3 -m venv "$VENV"
+    # --copies:网络卷上软链会莫名消失(mfs),venv 一律用实体文件
+    python3 -m venv --copies "$VENV"
 fi
 MARKER="$VENV/.deps_installed"
 if [ ! -f "$MARKER" ] || [ "requirements.txt" -nt "$MARKER" ] \
@@ -26,16 +29,26 @@ if [ ! -f "$MARKER" ] || [ "requirements.txt" -nt "$MARKER" ] \
     touch "$MARKER"
 fi
 
-# 按 GPU 数选布局(GPU_PLAN.md):
-#   1 卡 = 布局 A:全部落 GPU0,单泳道 FIFO(现状)
-#   ≥2 卡 = 布局 B:ComfyUI/FLUX 独占 GPU0;SAM2/YOLO 钉到 GPU1;service 双泳道并行
+# 按 GPU 数/显存选布局(GPU_PLAN.md):
+#   1 卡 <80G = 布局 A:全部落 GPU0,单泳道 FIFO(现状)
+#   1 卡 ≥80G = 布局 C:同 A,另起 qwenlayerd(bf16 基座+双 adapter ~40G 与
+#               FLUX 换载共存,96G 从容)
+#   ≥2 卡 = 布局 B:ComfyUI/FLUX 独占 GPU0;SAM2/YOLO 钉到 GPU1;双泳道并行
 N_GPU=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
+VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+QWENLD=0
 if [ "$N_GPU" -ge 2 ]; then
     echo "[run.sh] $N_GPU GPUs detected -> 双卡布局 B(Comfy@GPU0,SAM2/YOLO@GPU1,双泳道)"
     export DETECT_GPU=1
     export SERVICE_LANE_MODE=dual
+    QWENLD=1
+elif [ "${VRAM_MB:-0}" -ge 80000 ]; then
+    # 双泳道:qwen 生成(分钟级)走主道,检测/审核/抠取走副道,互不排队
+    echo "[run.sh] single GPU ${VRAM_MB}MiB -> 布局 C(双泳道 + qwenlayerd)"
+    export SERVICE_LANE_MODE=dual
+    QWENLD=1
 else
-    echo "[run.sh] single GPU -> 布局 A(单泳道)"
+    echo "[run.sh] single GPU ${VRAM_MB}MiB -> 布局 A(单泳道)"
     export SERVICE_LANE_MODE=single
 fi
 
@@ -48,8 +61,8 @@ bash "$SERVICE_DIR/sam2d.sh" || echo "[run.sh] warn: sam2 daemon start failed, s
 # 常驻 YOLO 检测 daemon(同上)
 bash "$SERVICE_DIR/yolod.sh" || echo "[run.sh] warn: yolo daemon start failed, yolo will not work"
 
-# 常驻 Qwen-Image-Layered 分层 daemon(仅双卡布局:单卡装不下 fp8 常驻)
-if [ "$N_GPU" -ge 2 ]; then
+# 常驻 Qwen-Image-Layered 分层 daemon(布局 B/C;v2:基座+six_slot/panelz 双 adapter)
+if [ "$QWENLD" = "1" ]; then
     bash "$SERVICE_DIR/qwenlayerd.sh" || echo "[run.sh] warn: qwen layered daemon start failed"
 fi
 

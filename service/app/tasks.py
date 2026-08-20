@@ -2744,15 +2744,25 @@ def handle_qwen_layered(payload: dict) -> dict:
     import urllib.request as _ur
     import urllib.error as _ue
     import json as _json
-    body = _json.dumps({
+    req_body = {
         "dir": str(run_dir),
         "image": payload.get("image") or "mid_fill.png",
         "output_dir": payload.get("output_dir") or "panel_layers_qwen",
-        "layers": int(payload.get("layers", 6)),
         "steps": int(payload.get("steps", 40)),
         "seed": int(payload.get("seed", 7)),
         "true_cfg": float(payload.get("true_cfg", 4.0)),
-    }).encode()
+    }
+    # v2 daemon 新增(可选,不传时 daemon 按 mode 默认;旧调用不受影响):
+    # mode=six_slot|panelz、names 帧名表、resolution 工作分辨率桶
+    if payload.get("mode"):
+        req_body["mode"] = payload["mode"]
+    if payload.get("layers") is not None:
+        req_body["layers"] = int(payload["layers"])
+    if payload.get("names"):
+        req_body["names"] = payload["names"]
+    if payload.get("resolution"):
+        req_body["resolution"] = int(payload["resolution"])
+    body = _json.dumps(req_body).encode()
     req = _ur.Request("http://127.0.0.1:8195/decompose", data=body,
                       headers={"Content-Type": "application/json"})
     try:
@@ -2767,7 +2777,111 @@ def handle_qwen_layered(payload: dict) -> dict:
         raise RuntimeError(f"qwen layered daemon HTTP {e.code}: {detail[-2000:]}")
     except _ue.URLError as e:
         raise RuntimeError(
-            f"qwen layered daemon 不可达({e.reason});该功能需要双卡布局") from None
+            f"qwen layered daemon 不可达({e.reason});daemon 未启动或仍在加载"
+            "(bf16 双 adapter 约需 5~7 分钟,看 /health 的 qwen_layered_up)") from None
+
+
+def handle_element_extract(payload: dict) -> dict:
+    """新管线(/pipeline2):把分离层上记录的元素逐个抠成独立素材。
+
+    对每个元素在其来源层上做"窗口内连通域"判定:
+      - 元素的 alpha 连通域完全落在 bbox 附近(孤立)→ 直接按连通域紧裁存 PNG;
+      - 连通域伸出窗口边界/大幅超出 bbox(与邻居粘连)→ 标记 needs_sam2,
+        由前端对该层批量提交 sam2 任务处理。
+
+    payload:
+        run_id / dir   二选一
+        layer          来源层文件名(如 p2_sixslot/icon.png)
+        elements       [{"id": str, "bbox": [cx,cy,w,h] 归一化}]
+        out_dir        输出目录,默认 p2_elements
+        alpha_thr      alpha 前景阈值,默认 8
+        pad_ratio      分析窗口外扩(相对 bbox 长边),默认 0.25
+        overflow_px    紧致边界超出 bbox 判粘连的容差像素,默认 8
+    返回 {saved: [{id, file, bbox}], needs_sam2: [id...], elapsed_sec}
+    """
+    import numpy as _np
+    from collections import deque as _deque
+    if payload.get("dir"):
+        run_dir = Path(payload["dir"])
+    else:
+        run_dir = storage.get_run_dir(payload["run_id"])
+    layer_name = payload["layer"]
+    layer_path = run_dir / layer_name
+    if not layer_path.is_file():
+        raise FileNotFoundError(f"layer not found: {layer_path}")
+    elements = payload.get("elements") or []
+    if not elements:
+        raise ValueError("payload.elements must be a non-empty array")
+    out_rel = payload.get("out_dir") or "p2_elements"
+    alpha_thr = int(payload.get("alpha_thr", 8))
+    pad_ratio = float(payload.get("pad_ratio", 0.25))
+    overflow_px = int(payload.get("overflow_px", 8))
+
+    started = time.time()
+    with Image.open(layer_path) as im:
+        layer = im.convert("RGBA")
+    W, H = layer.size
+    alpha = _np.asarray(layer.getchannel("A"))
+    out_dir = run_dir / out_rel
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved, needs_sam2 = [], []
+    for el in elements:
+        cx, cy, w, h = (float(v) for v in el["bbox"][:4])
+        bx0 = int((cx - w / 2) * W)
+        by0 = int((cy - h / 2) * H)
+        bx1 = int(math.ceil((cx + w / 2) * W))
+        by1 = int(math.ceil((cy + h / 2) * H))
+        pad = max(12, int(max(bx1 - bx0, by1 - by0) * pad_ratio))
+        wx0, wy0 = max(0, bx0 - pad), max(0, by0 - pad)
+        wx1, wy1 = min(W, bx1 + pad), min(H, by1 + pad)
+        win = alpha[wy0:wy1, wx0:wx1] > alpha_thr
+        wh, ww = win.shape
+        # 种子 = bbox 内的前景像素;BFS 收整个连通域(4 邻域)
+        sy0, sy1 = max(0, by0 - wy0), min(wh, by1 - wy0)
+        sx0, sx1 = max(0, bx0 - wx0), min(ww, bx1 - wx0)
+        seeds = _np.argwhere(win[sy0:sy1, sx0:sx1])
+        if seeds.size == 0:
+            needs_sam2.append(el["id"])
+            continue
+        visited = _np.zeros_like(win, dtype=bool)
+        dq = _deque()
+        for sy, sx in seeds[::max(1, len(seeds) // 512)]:
+            y, x = int(sy) + sy0, int(sx) + sx0
+            if not visited[y, x]:
+                visited[y, x] = True
+                dq.append((y, x))
+        touched_border = False
+        while dq:
+            y, x = dq.popleft()
+            if y in (0, wh - 1) or x in (0, ww - 1):
+                # 窗口边缘本身贴画布边时不算粘连
+                if not (wy0 + y in (0, H - 1) or wx0 + x in (0, W - 1)):
+                    touched_border = True
+            for ny, nx in ((y-1, x), (y+1, x), (y, x-1), (y, x+1)):
+                if 0 <= ny < wh and 0 <= nx < ww and win[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    dq.append((ny, nx))
+        ys, xs = _np.nonzero(visited)
+        ty0, ty1 = wy0 + ys.min(), wy0 + ys.max() + 1
+        tx0, tx1 = wx0 + xs.min(), wx0 + xs.max() + 1
+        overflow = max(bx0 - tx0, by0 - ty0, tx1 - bx1, ty1 - by1)
+        if touched_border or overflow > overflow_px:
+            needs_sam2.append(el["id"])
+            continue
+        # 孤立:按连通域掩码紧裁存素材(visited 坐标平移到紧裁坐标系)
+        crop = layer.crop((tx0, ty0, tx1, ty1))
+        mask = _np.zeros((ty1 - ty0, tx1 - tx0), dtype=_np.uint8)
+        mask[ys + wy0 - ty0, xs + wx0 - tx0] = 255
+        arr = _np.asarray(crop).copy()
+        arr[..., 3] = _np.minimum(arr[..., 3], mask)
+        fname = f"{out_rel}/{el['id']}.png"
+        Image.fromarray(arr).save(run_dir / fname)
+        saved.append({"id": el["id"], "file": fname,
+                      "bbox": [((tx0 + tx1) / 2) / W, ((ty0 + ty1) / 2) / H,
+                               (tx1 - tx0) / W, (ty1 - ty0) / H]})
+    return {"saved": saved, "needs_sam2": needs_sam2,
+            "elapsed_sec": round(time.time() - started, 1)}
 
 
 def register_all() -> None:
@@ -2786,3 +2900,18 @@ def register_all() -> None:
     worker.register("panel_extract", handle_panel_extract)
     worker.register("panel_peel", handle_panel_peel)
     worker.register("qwen_layered", handle_qwen_layered)
+    worker.register("element_extract", handle_element_extract)
+    # 新管线(/pipeline2)步骤任务:编排与像素操作全在 Python 侧
+    from . import pipeline2
+    worker.register("p2_detect", pipeline2.handle_p2_detect)
+    worker.register("p2_sixslot", pipeline2.handle_p2_sixslot)
+    worker.register("p2_panelz", pipeline2.handle_p2_panelz)
+    worker.register("p2_yolo", pipeline2.handle_p2_yolo)
+    worker.register("p2_gpt", pipeline2.handle_p2_gpt)
+    worker.register("p2_extract", pipeline2.handle_p2_extract)
+    worker.register("p2_assets", pipeline2.handle_p2_assets)
+    worker.register("p2_layer_yolo", pipeline2.handle_p2_layer_yolo)
+    worker.register("p2_inventory", pipeline2.handle_p2_inventory)
+    worker.register("p2_cascade", pipeline2.handle_p2_cascade)
+    worker.register("p2_psd", pipeline2.handle_p2_psd)
+    worker.register("p2_recompose", pipeline2.handle_p2_recompose)
